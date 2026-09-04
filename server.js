@@ -112,8 +112,13 @@ app.get('/api/profile/:userId', async (req, res) => {
 });
 
 app.post('/api/profile/edit', async (req, res) => {
-  const { userId, bio, instaId, avatar } = req.body;
-  await supabase.from('users').update({ bio, instagram_handle: instaId, avatar }).eq('id', userId);
+  const { userId, bio, instaId, avatar, profilePic } = req.body;
+  await supabase.from('users').update({ 
+    bio, 
+    instagram_handle: instaId, 
+    avatar, 
+    profile_pic: profilePic 
+  }).eq('id', userId);
   res.json({ success: true });
 });
 
