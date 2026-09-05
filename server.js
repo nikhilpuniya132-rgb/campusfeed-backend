@@ -16,15 +16,24 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 // AUTHENTICATION & LOGIN
 // ==========================================
 app.post('/api/auth', async (req, res) => {
-  const { handle, password, grade, avatar, refCode, instagramHandle, profilePic } = req.body;
+  const { handle, password, grade, avatar, refCode } = req.body;
   
   let { data: user, error } = await supabase.from('users').select('*').eq('handle', handle).single();
   
   if (!user) {
     const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+    
+    // If they used a referral code, credit the referrer
+    if (refCode) {
+      const { data: referrer } = await supabase.from('users').select('*').eq('invite_code', refCode.trim().toUpperCase()).single();
+      if (referrer) {
+        await supabase.from('users').update({ invites: referrer.invites + 1 }).eq('id', referrer.id);
+      }
+    }
+
     const newUser = { 
-      handle, password, grade, avatar, ref_code: refCode, invite_code: inviteCode, 
-      invites: 3, total_votes: 0, instagram_handle: instagramHandle, profile_pic: profilePic 
+      handle, password, grade, avatar, invite_code: inviteCode, 
+      invites: 3, total_votes: 0 
     };
     
     const { data: createdUser, error: insertError } = await supabase.from('users').insert([newUser]).select().single();
@@ -38,18 +47,23 @@ app.post('/api/auth', async (req, res) => {
 });
 
 // ==========================================
-// POLLS & VOTING
+// POLLS, SHUFFLING & VOTING
 // ==========================================
 app.get('/api/play/:userId', async (req, res) => {
   const { gradeFilter } = req.query;
   const { data: polls } = await supabase.from('polls').select('*');
-  const randomPoll = polls[Math.floor(Math.random() * polls.length)];
+  const randomPoll = polls ? polls[Math.floor(Math.random() * polls.length)] : null;
   
-  let query = supabase.from('users').select('id, handle, avatar, profile_pic, grade').neq('id', req.params.userId).limit(4);
-  if (gradeFilter !== 'all') query = query.eq('grade', gradeFilter);
-  const { data: options } = await query;
+  let query = supabase.from('users').select('id, handle, avatar, profile_pic, grade').neq('id', req.params.userId);
+  if (gradeFilter && gradeFilter !== 'all') {
+    query = query.eq('grade', gradeFilter);
+  }
   
-  res.json({ poll: randomPoll, options });
+  const { data: allUsers } = await query;
+  // Shuffle options randomly on the server side
+  const shuffledOptions = allUsers ? allUsers.sort(() => 0.5 - Math.random()).slice(0, 4) : [];
+  
+  res.json({ poll: randomPoll, options: shuffledOptions });
 });
 
 app.post('/api/vote', async (req, res) => {
@@ -57,30 +71,36 @@ app.post('/api/vote', async (req, res) => {
   await supabase.from('votes').insert([{ poll_id: pollId, voter_id: voterId, receiver_id: receiverId }]);
   
   const { data: receiver } = await supabase.from('users').select('total_votes').eq('id', receiverId).single();
-  await supabase.from('users').update({ total_votes: receiver.total_votes + 1 }).eq('id', receiverId);
+  if (receiver) {
+    await supabase.from('users').update({ total_votes: receiver.total_votes + 1 }).eq('id', receiverId);
+  }
   res.json({ success: true });
 });
 
 // ==========================================
-// INBOX & NOTIFICATIONS
+// INBOX & PRIVACY LOCK
 // ==========================================
 app.get('/api/inbox/:userId', async (req, res) => {
   const { data: user } = await supabase.from('users').select('invites').eq('id', req.params.userId).single();
   
   const { data: votes } = await supabase
     .from('votes')
-    .select(`id, status, is_saved, is_crush, polls(question), users!voter_id(handle)`)
+    .select(`id, status, is_saved, is_crush, polls(question), users!voter_id(handle, profile_pic, avatar)`)
     .eq('receiver_id', req.params.userId)
     .order('created_at', { ascending: false });
+
+  // Privacy lock: If user has less than 4 invites (meaning they haven't shared with a friend to gain more), hide voter identities
+  const userInvites = user ? user.invites : 3;
+  const canReveal = userInvites > 3;
 
   const formattedVotes = votes ? votes.map(v => ({
     voteId: v.id,
     question: v.polls ? v.polls.question : '',
-    voterHandle: v.users ? v.users.handle : null,
+    voterHandle: canReveal ? (v.users ? v.users.handle : null) : null,
     isSaved: v.is_saved
   })) : [];
 
-  res.json({ invites: user ? user.invites : 0, messages: formattedVotes });
+  res.json({ invites: userInvites, canReveal, messages: formattedVotes });
 });
 
 app.delete('/api/inbox/:voteId', async (req, res) => {
@@ -94,7 +114,7 @@ app.put('/api/inbox/:voteId/save', async (req, res) => {
 });
 
 // ==========================================
-// EXPLORE & PROFILE
+// EXPLORE, PROFILE & ACCOUNT DELETION
 // ==========================================
 app.get('/api/explore/leaderboard', async (req, res) => {
   const { data: leaderboard } = await supabase.from('users').select('id, handle, avatar, profile_pic, grade, total_votes').order('total_votes', { ascending: false }).limit(10);
@@ -119,6 +139,18 @@ app.post('/api/profile/edit', async (req, res) => {
     avatar, 
     profile_pic: profilePic 
   }).eq('id', userId);
+  res.json({ success: true });
+});
+
+app.post('/api/profile/delete', async (req, res) => {
+  const { userId, password } = req.body;
+  const { data: user } = await supabase.from('users').select('password').eq('id', userId).single();
+  
+  if (!user || user.password !== password) {
+    return res.status(401).json({ error: 'Incorrect password' });
+  }
+
+  await supabase.from('users').delete().eq('id', userId);
   res.json({ success: true });
 });
 
