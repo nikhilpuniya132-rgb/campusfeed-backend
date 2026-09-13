@@ -75,8 +75,8 @@ app.post('/api/vote', async (req, res) => {
 // PROFILE MANAGEMENT
 app.put('/api/profile/:userId', async (req, res) => {
   try {
-    const { bio, avatar } = req.body;
-    const { data: updatedUser } = await supabase.from('users').update({ bio, avatar }).eq('id', req.params.userId).select().single();
+    const { bio, avatar, ring } = req.body; 
+    const { data: updatedUser } = await supabase.from('users').update({ bio, avatar, ring }).eq('id', req.params.userId).select().single();
     res.json({ success: true, user: updatedUser });
   } catch (err) {
     res.status(500).json({ error: err.message });
