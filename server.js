@@ -12,13 +12,14 @@ app.use(cors({ origin: '*' }));
 app.options('*', cors());
 app.use(express.json({ limit: '5mb' }));
 
+// Initialize Database & Payment Gateway
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_placeholder',
-  key_secret: process.env.RAZORPAY_KEY_SECRET || 'secret_placeholder',
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// AUTHENTICATION
+// --- AUTHENTICATION ---
 app.post('/api/auth', async (req, res) => {
   try {
     const { handle, password, grade, avatar, refCode } = req.body;
@@ -42,7 +43,7 @@ app.post('/api/auth', async (req, res) => {
   }
 });
 
-// PLAY & VOTING
+// --- PLAY & VOTING ---
 app.get('/api/play/:userId', async (req, res) => {
   try {
     const { gradeFilter } = req.query;
@@ -72,7 +73,7 @@ app.post('/api/vote', async (req, res) => {
   }
 });
 
-// PROFILE MANAGEMENT
+// --- PROFILE MANAGEMENT ---
 app.put('/api/profile/:userId', async (req, res) => {
   try {
     const { bio, avatar, ring } = req.body; 
@@ -96,7 +97,6 @@ app.delete('/api/profile/:userId', async (req, res) => {
   }
 });
 
-// PUBLIC PROFILE (Fix for endless loading when clicking someone on leaderboard)
 app.get('/api/profile/public/:userId', async (req, res) => {
   try {
     const { data: user } = await supabase.from('users').select('id, handle, bio, avatar, profile_pic, total_votes, is_pro').eq('id', req.params.userId).single();
@@ -106,12 +106,14 @@ app.get('/api/profile/public/:userId', async (req, res) => {
   }
 });
 
-// RAZORPAY GATEWAY
+// --- RAZORPAY GATEWAY ---
 app.post('/api/pay/order', async (req, res) => {
   try {
-    const order = await razorpay.orders.create({ amount: 9900, currency: 'INR', receipt: `rcpt_${req.body.userId}` });
+    const { userId, amount = 9900 } = req.body; // 9900 paise = 99 INR
+    const order = await razorpay.orders.create({ amount, currency: 'INR', receipt: `rcpt_${userId}_${Date.now()}` });
     res.json(order);
   } catch (error) {
+    console.error(error);
     res.status(500).json({ error: 'Failed to create order' });
   }
 });
@@ -119,11 +121,12 @@ app.post('/api/pay/order', async (req, res) => {
 app.post('/api/pay/verify', async (req, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId } = req.body;
+    
     const hmac = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET);
     hmac.update(`${razorpay_order_id}|${razorpay_payment_id}`);
     
     if (hmac.digest('hex') === razorpay_signature) {
-      const { data } = await supabase.from('users').update({ is_pro: true }).eq('id', userId).select().single();
+      const { data } = await supabase.from('users').update({ is_pro: true, ring: 'gold' }).eq('id', userId).select().single();
       res.json({ success: true, user: data });
     } else {
       res.status(400).json({ success: false, message: 'Invalid signature' });
@@ -133,7 +136,7 @@ app.post('/api/pay/verify', async (req, res) => {
   }
 });
 
-// INBOX & EXPLORE
+// --- INBOX & EXPLORE ---
 app.get('/api/inbox/:userId', async (req, res) => {
   try {
     const { data: user } = await supabase.from('users').select('invites, is_pro').eq('id', req.params.userId).single();
