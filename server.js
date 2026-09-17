@@ -55,55 +55,106 @@ app.post('/api/auth/google', async (req, res) => {
       .eq('email', email)
       .single();
 
-    // 2. If they don't exist, this is a brand new signup! Let's create their profile.
+    // 2. If they don't exist, this is a new signup! Return isNewUser flag and basic info (no auto-insert)
     if (!user) {
-      // Auto-generate a handle using their first name + random numbers (e.g., nikhil832)
-      const baseHandle = name ? name.split(' ')[0].toLowerCase().replace(/[^a-z0-9]/g, '') : 'campus';
-      const randomTag = Math.floor(100 + Math.random() * 900);
-      const newHandle = `${baseHandle}${randomTag}`;
-
-      const { data: newUser, error: insertError } = await supabase
-        .from('users')
-        .insert([{
-          email: email,
-          google_id: googleId,
-          handle: newHandle,
-          grade: parseInt(grade) || 11,
-          profile_pic: avatar, // Sets their Google photo as their main picture
-          avatar: '😎',        // Default emoji avatar backup
-          is_pro: false,
-          total_votes: 0,
-          ring: 'none',
-          bio: `Class ${grade} - St. Kabir`
-        }])
-        .select()
-        .single();
-
-      if (insertError) {
-        console.error("Insert Error:", insertError);
-        return res.status(400).json({ error: 'Failed to create new user profile' });
-      }
-      
-      user = newUser;
-    } else {
-      // Optional: If they already exist, you could update their grade if it changed
-      if (user.grade.toString() !== grade) {
-        const { data: updatedUser } = await supabase
-          .from('users')
-          .update({ grade: parseInt(grade) })
-          .eq('id', user.id)
-          .select()
-          .single();
-        if (updatedUser) user = updatedUser;
-      }
+      return res.json({
+        isNewUser: true,
+        googleUser: {
+          googleId,
+          email,
+          name: name || '',
+          avatar: avatar || ''
+        }
+      });
     }
 
-    // 3. Send the complete user profile back to the React frontend
-    res.json({ user });
+    // 3. If user exists, send their profile back to unlock UI
+    res.json({ isNewUser: false, user });
 
   } catch (error) {
     console.error("Google Auth Sync Error:", error);
     res.status(500).json({ error: 'Internal server error during authentication' });
+  }
+});
+
+// --- COMPLETE ONBOARDING ROUTE ---
+app.post('/api/user/complete-onboarding', async (req, res) => {
+  const {
+    googleId,
+    email,
+    name,
+    handle,
+    gender,
+    school = 'St. Kabir Convent Senior Secondary School',
+    city = 'Bathinda',
+    grade = 11,
+    avatar = '😎',
+    profilePic = '',
+    refCode
+  } = req.body;
+
+  try {
+    const cleanHandle = (handle || name || 'campus').replace(/^@/, '').trim();
+
+    // Check if handle is already taken
+    const { data: existingHandle } = await supabase
+      .from('users')
+      .select('id')
+      .ilike('handle', cleanHandle)
+      .single();
+
+    let finalHandle = cleanHandle;
+    if (existingHandle) {
+      finalHandle = `${cleanHandle}${Math.floor(100 + Math.random() * 900)}`;
+    }
+
+    // Handle invite code
+    const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+    if (refCode) {
+      const { data: referrer } = await supabase
+        .from('users')
+        .select('*')
+        .eq('invite_code', refCode.trim().toUpperCase())
+        .single();
+      if (referrer) {
+        await supabase
+          .from('users')
+          .update({ invites: (referrer.invites || 0) + 1 })
+          .eq('id', referrer.id);
+      }
+    }
+
+    // Insert new user into Supabase
+    const newUser = {
+      email,
+      google_id: googleId,
+      handle: finalHandle,
+      grade: parseInt(grade) || 11,
+      profile_pic: profilePic || '',
+      avatar: avatar || '😎',
+      invite_code: inviteCode,
+      invites: 0,
+      total_votes: 0,
+      is_pro: false,
+      ring: 'none',
+      bio: `Class ${grade} • St. Kabir`
+    };
+
+    const { data: createdUser, error: insertError } = await supabase
+      .from('users')
+      .insert([newUser])
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error('Insert User Onboarding Error:', insertError);
+      return res.status(400).json({ error: 'Failed to create user profile: ' + insertError.message });
+    }
+
+    res.json({ user: createdUser });
+  } catch (error) {
+    console.error('Complete Onboarding Error:', error);
+    res.status(500).json({ error: 'Internal server error during onboarding' });
   }
 });
 
