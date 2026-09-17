@@ -173,9 +173,17 @@ app.get('/api/play/:userId', async (req, res) => {
     const randomPoll = polls && polls.length > 0 ? polls[Math.floor(Math.random() * polls.length)] : null;
 
     let query = supabase.from('users').select('id, handle, avatar, profile_pic, grade, is_pro').neq('id', req.params.userId);
-    if (gradeFilter && gradeFilter !== 'all') query = query.eq('grade', gradeFilter);
+    if (gradeFilter && gradeFilter !== 'all') {
+      query = query.or(`grade.eq.${gradeFilter},grade.eq.${parseInt(gradeFilter) || gradeFilter}`);
+    }
 
-    const { data: allUsers } = await query;
+    let { data: allUsers } = await query;
+    // If fewer than 4 classmates in this grade, augment with whole school to keep game active
+    if (!allUsers || allUsers.length < 4) {
+      const { data: schoolUsers } = await supabase.from('users').select('id, handle, avatar, profile_pic, grade, is_pro').neq('id', req.params.userId);
+      allUsers = schoolUsers || allUsers || [];
+    }
+
     const shuffledOptions = allUsers ? allUsers.sort(() => 0.5 - Math.random()).slice(0, 4) : [];
     res.json({ poll: randomPoll, options: shuffledOptions });
   } catch (err) {
@@ -198,8 +206,22 @@ app.post('/api/vote', async (req, res) => {
 // --- PROFILE MANAGEMENT ---
 app.put('/api/profile/:userId', async (req, res) => {
   try {
-    const { bio, avatar, ring } = req.body; 
-    const { data: updatedUser } = await supabase.from('users').update({ bio, avatar, ring }).eq('id', req.params.userId).select().single();
+    const { bio, avatar, ring, profile_pic, grade } = req.body;
+    const updateData = {};
+    if (bio !== undefined) updateData.bio = bio;
+    if (avatar !== undefined) updateData.avatar = avatar;
+    if (ring !== undefined) updateData.ring = ring;
+    if (profile_pic !== undefined) updateData.profile_pic = profile_pic;
+    if (grade !== undefined) updateData.grade = grade.toString();
+
+    const { data: updatedUser, error } = await supabase
+      .from('users')
+      .update(updateData)
+      .eq('id', req.params.userId)
+      .select()
+      .single();
+
+    if (error) throw error;
     res.json({ success: true, user: updatedUser });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -476,6 +498,100 @@ app.get('/api/friends/:userId', async (req, res) => {
     if (error) throw error;
     res.json({ friendships: friendships || [] });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Incoming pending friend requests for notifications
+app.get('/api/friends/pending/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data: requests, error } = await supabase
+      .from('friendships')
+      .select('*')
+      .eq('receiver_id', userId)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    if (!requests || requests.length === 0) return res.json({ pending: [] });
+
+    const requesterIds = requests.map(r => r.requester_id).filter(Boolean);
+    const { data: requesters } = await supabase
+      .from('users')
+      .select('id, handle, name, avatar, profile_pic, grade, ring, is_pro')
+      .in('id', requesterIds);
+
+    const userMap = {};
+    (requesters || []).forEach(u => { userMap[u.id] = u; });
+
+    const pending = requests.map(r => ({
+      friendshipId: r.id,
+      requesterId: r.requester_id,
+      createdAt: r.created_at,
+      requester: userMap[r.requester_id] || { handle: 'classmate', avatar: '😎' }
+    }));
+
+    res.json({ pending });
+  } catch (err) {
+    console.error('Pending Friends Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Respond to friend request (accept or decline)
+app.post('/api/friends/respond', async (req, res) => {
+  try {
+    const { friendshipId, action } = req.body;
+    if (!friendshipId || !action) {
+      return res.status(400).json({ error: 'friendshipId and action are required' });
+    }
+
+    if (action === 'accept') {
+      const { data, error } = await supabase
+        .from('friendships')
+        .update({ status: 'accepted' })
+        .eq('id', friendshipId)
+        .select()
+        .single();
+      if (error) throw error;
+      return res.json({ success: true, status: 'accepted', friendship: data });
+    } else {
+      const { error } = await supabase
+        .from('friendships')
+        .delete()
+        .eq('id', friendshipId);
+      if (error) throw error;
+      return res.json({ success: true, status: 'declined' });
+    }
+  } catch (err) {
+    console.error('Respond Friend Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Accepted friends count and list for Profile tab
+app.get('/api/friends/accepted/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data: list, error } = await supabase
+      .from('friendships')
+      .select('*')
+      .eq('status', 'accepted')
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
+
+    if (error) throw error;
+    if (!list || list.length === 0) return res.json({ count: 0, friends: [] });
+
+    const friendIds = list.map(f => f.requester_id === userId ? f.receiver_id : f.requester_id).filter(Boolean);
+    const { data: friendsUsers } = await supabase
+      .from('users')
+      .select('id, handle, name, avatar, profile_pic, grade, ring, is_pro, total_votes')
+      .in('id', friendIds);
+
+    res.json({ count: (friendsUsers || []).length, friends: friendsUsers || [] });
+  } catch (err) {
+    console.error('Accepted Friends Error:', err);
     res.status(500).json({ error: err.message });
   }
 });
