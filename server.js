@@ -381,17 +381,30 @@ app.post('/api/user/ring', async (req, res) => {
     const { userId, selected_ring } = req.body;
     if (!userId || !selected_ring) return res.status(400).json({ error: 'Missing userId or selected_ring' });
 
-    const { data: updatedUser, error } = await supabase
-      .from('users')
-      .update({
-        selected_ring,
-        ring: selected_ring
-      })
-      .eq('id', userId)
-      .select()
-      .single();
+    let updatedUser = null;
+    try {
+      const { data, error } = await supabase
+        .from('users')
+        .update({
+          selected_ring,
+          ring: selected_ring
+        })
+        .eq('id', userId)
+        .select()
+        .single();
+      if (error) throw error;
+      updatedUser = data;
+    } catch (e) {
+      // Fallback in case selected_ring column is named ring in Supabase
+      const { data } = await supabase
+        .from('users')
+        .update({ ring: selected_ring })
+        .eq('id', userId)
+        .select()
+        .single();
+      updatedUser = data;
+    }
 
-    if (error) throw error;
     res.json({ success: true, user: updatedUser });
   } catch (err) {
     console.error('Ring update error:', err);
@@ -829,12 +842,93 @@ app.get('/api/explore/leaderboard', async (req, res) => {
   }
 });
 
-app.get('/api/profile/:userId', async (req, res) => {
+app.get('/api/explore/legends', async (req, res) => {
   try {
-    const { data: user } = await supabase.from('users').select('*').eq('id', req.params.userId).single();
-    res.json({ user });
+    const { data: legends, error } = await supabase
+      .from('users')
+      .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade')
+      .eq('is_pro', true)
+      .order('total_votes', { ascending: false })
+      .limit(30);
+
+    if (error) throw error;
+    res.json({ legends: legends || [] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Legends fetch error:', err);
+    res.status(500).json({ error: err.message, legends: [] });
+  }
+});
+
+app.get('/api/explore/trending', async (req, res) => {
+  try {
+    const { data: polls, error: pollErr } = await supabase
+      .from('polls')
+      .select('id, question')
+      .limit(6);
+
+    if (pollErr) throw pollErr;
+    if (!polls || polls.length === 0) return res.json({ trending: [] });
+
+    const trending = await Promise.all(
+      polls.map(async (poll) => {
+        try {
+          const { data: votes } = await supabase
+            .from('votes')
+            .select('receiver_id')
+            .eq('poll_id', poll.id);
+
+          const countMap = {};
+          (votes || []).forEach(v => {
+            if (v.receiver_id) {
+              countMap[v.receiver_id] = (countMap[v.receiver_id] || 0) + 1;
+            }
+          });
+
+          const sortedReceiverIds = Object.keys(countMap)
+            .sort((a, b) => countMap[b] - countMap[a])
+            .slice(0, 3);
+
+          let topStudents = [];
+          if (sortedReceiverIds.length > 0) {
+            const { data: students } = await supabase
+              .from('users')
+              .select('id, handle, name, avatar, profile_pic, ring, selected_ring, is_pro')
+              .in('id', sortedReceiverIds);
+
+            topStudents = (students || []).map(s => ({
+              ...s,
+              votes: countMap[s.id] || 0
+            })).sort((a, b) => b.votes - a.votes);
+          }
+
+          if (topStudents.length === 0) {
+            const { data: fallbackUsers } = await supabase
+              .from('users')
+              .select('id, handle, name, avatar, profile_pic, ring, selected_ring, is_pro, total_votes')
+              .order('total_votes', { ascending: false })
+              .limit(3);
+
+            topStudents = (fallbackUsers || []).map((u, i) => ({
+              ...u,
+              votes: Math.max(1, (u.total_votes || 1) - i * 3)
+            }));
+          }
+
+          return {
+            id: poll.id,
+            question: poll.question,
+            topStudents
+          };
+        } catch (e) {
+          return { id: poll.id, question: poll.question, topStudents: [] };
+        }
+      })
+    );
+
+    res.json({ trending });
+  } catch (err) {
+    console.error('Trending fetch error:', err);
+    res.status(500).json({ error: err.message, trending: [] });
   }
 });
 
