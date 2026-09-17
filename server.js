@@ -27,11 +27,16 @@ app.post('/api/auth', async (req, res) => {
 
     if (!user) {
       const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-      if (refCode) {
-        const { data: referrer } = await supabase.from('users').select('*').eq('invite_code', refCode.trim().toUpperCase()).single();
-        if (referrer) await supabase.from('users').update({ invites: referrer.invites + 1 }).eq('id', referrer.id);
+      const cleanRef = refCode ? refCode.trim().replace(/^@/, '') : null;
+      if (cleanRef) {
+        const { data: referrer } = await supabase
+          .from('users')
+          .select('*')
+          .or(`invite_code.ilike.${cleanRef},handle.ilike.${cleanRef}`)
+          .maybeSingle();
+        if (referrer) await supabase.from('users').update({ invites: (referrer.invites || 0) + 1 }).eq('id', referrer.id);
       }
-      const newUser = { handle, password, grade, avatar, invite_code: inviteCode, invites: 0, total_votes: 0, is_pro: false };
+      const newUser = { handle, password, grade, avatar, invite_code: inviteCode, invite_code_used: cleanRef, invites: 0, total_votes: 0, is_pro: false };
       const { data: createdUser } = await supabase.from('users').insert([newUser]).select().single();
       user = createdUser;
     } else if (user.password !== password) {
@@ -110,12 +115,13 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
 
     // Handle invite code
     const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-    if (refCode) {
+    const cleanRef = refCode ? refCode.trim().replace(/^@/, '') : null;
+    if (cleanRef) {
       const { data: referrer } = await supabase
         .from('users')
         .select('*')
-        .eq('invite_code', refCode.trim().toUpperCase())
-        .single();
+        .or(`invite_code.ilike.${cleanRef},handle.ilike.${cleanRef}`)
+        .maybeSingle();
       if (referrer) {
         await supabase
           .from('users')
@@ -133,6 +139,7 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
       profile_pic: profilePic || '',
       avatar: avatar || '😎',
       invite_code: inviteCode,
+      invite_code_used: cleanRef,
       invites: 0,
       total_votes: 0,
       is_pro: false,
@@ -254,16 +261,208 @@ app.post('/api/pay/verify', async (req, res) => {
 // --- INBOX & EXPLORE ---
 app.get('/api/inbox/:userId', async (req, res) => {
   try {
-    const { data: user } = await supabase.from('users').select('invites, is_pro').eq('id', req.params.userId).single();
-    const { data: votes } = await supabase.from('votes').select(`id, polls(question), users!voter_id(handle, avatar)`).eq('receiver_id', req.params.userId).order('created_at', { ascending: false });
+    const { data: user } = await supabase.from('users').select('*').eq('id', req.params.userId).single();
+    const { data: votes } = await supabase.from('votes').select(`id, polls(question), users!voter_id(handle, name, avatar, profile_pic, ring, is_pro)`).eq('receiver_id', req.params.userId).order('created_at', { ascending: false });
     
-    const canReveal = Boolean(user?.is_pro) || (user && user.invites >= 4);
+    let inviteCount = 0;
+    const cleanHandle = user?.handle?.replace(/^@/, '').trim();
+    const cleanCode = user?.invite_code?.trim();
+    const filterParts = [];
+    if (cleanHandle) filterParts.push(`invite_code_used.ilike.${cleanHandle}`);
+    if (cleanCode) filterParts.push(`invite_code_used.ilike.${cleanCode}`);
+    if (filterParts.length > 0) {
+      const { data: invitedUsers } = await supabase.from('users').select('id').or(filterParts.join(','));
+      inviteCount = (invitedUsers || []).length;
+    }
+    const effectiveInvites = Math.max(inviteCount, user?.invites || 0);
+    const canReveal = Boolean(user?.is_pro) || effectiveInvites >= 3;
+
     const messages = (votes || []).map(v => ({
-      voteId: v.id, question: v.polls?.question, 
-      voterHandle: canReveal ? v.users?.handle : null, 
-      voterAvatar: canReveal ? v.users?.avatar : '🔒'
+      voteId: v.id,
+      question: v.polls?.question,
+      voterHandle: canReveal ? v.users?.handle : null,
+      voterName: canReveal ? (v.users?.name || v.users?.handle) : null,
+      voterAvatar: canReveal ? v.users?.avatar : '🔒',
+      voterPic: canReveal ? v.users?.profile_pic : '',
+      isPro: canReveal ? Boolean(v.users?.is_pro) : false,
+      ring: canReveal ? (v.users?.ring || 'none') : 'none'
     }));
-    res.json({ canReveal, messages });
+    res.json({ canReveal, effectiveInvites, remaining: Math.max(0, 3 - effectiveInvites), messages });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- 3-INVITE REWARD & REVEAL LOGIC ---
+app.post('/api/inbox/reveal', async (req, res) => {
+  try {
+    const { voteId, userId } = req.body;
+    if (!voteId || !userId) {
+      return res.status(400).json({ error: 'voteId and userId are required' });
+    }
+
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Query users table to count how many accounts used this user's handle or invite code
+    let count = 0;
+    const cleanHandle = user.handle?.replace(/^@/, '').trim();
+    const cleanCode = user.invite_code?.trim();
+    const filterParts = [];
+    if (cleanHandle) filterParts.push(`invite_code_used.ilike.${cleanHandle}`);
+    if (cleanCode) filterParts.push(`invite_code_used.ilike.${cleanCode}`);
+
+    if (filterParts.length > 0) {
+      const { data: invitedUsers } = await supabase
+        .from('users')
+        .select('id')
+        .or(filterParts.join(','));
+      count = (invitedUsers || []).length;
+    }
+    const effectiveInvites = Math.max(count, user.invites || 0);
+
+    // If count < 3 and user is not Pro, return 403 with remaining count
+    if (!user.is_pro && effectiveInvites < 3) {
+      const remaining = Math.max(0, 3 - effectiveInvites);
+      return res.status(403).json({
+        error: 'Invite requirement not met',
+        remaining,
+        count: effectiveInvites
+      });
+    }
+
+    // Fetch the vote with voter and poll details
+    const { data: vote, error: voteError } = await supabase
+      .from('votes')
+      .select(`id, poll_id, voter_id, users!voter_id(id, handle, name, avatar, profile_pic, ring, is_pro), polls(question)`)
+      .eq('id', voteId)
+      .single();
+
+    if (voteError || !vote) {
+      return res.status(404).json({ error: 'Vote not found' });
+    }
+
+    res.json({
+      success: true,
+      revealed: true,
+      voterName: vote.users?.name || vote.users?.handle || 'Classmate',
+      voterHandle: vote.users?.handle,
+      voterAvatar: vote.users?.avatar || '😎',
+      voterPic: vote.users?.profile_pic || '',
+      isPro: Boolean(vote.users?.is_pro),
+      ring: vote.users?.ring || 'none',
+      question: vote.polls?.question
+    });
+  } catch (err) {
+    console.error('Reveal Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- IN-APP FRIEND SYSTEM ---
+app.get('/api/friends/search', async (req, res) => {
+  try {
+    const { q, userId } = req.query;
+    if (!q || !q.trim()) return res.json({ users: [] });
+
+    const cleanQuery = q.trim().replace(/^@/, '');
+    let query = supabase
+      .from('users')
+      .select('id, handle, name, avatar, profile_pic, grade, ring, is_pro')
+      .ilike('handle', `%${cleanQuery}%`)
+      .limit(25);
+
+    if (userId) {
+      query = query.neq('id', userId);
+    }
+
+    const { data: matchedUsers, error: usersErr } = await query;
+    if (usersErr) throw usersErr;
+
+    let results = matchedUsers || [];
+
+    if (userId && results.length > 0) {
+      const userIds = results.map(u => u.id);
+      const { data: userFriendships } = await supabase
+        .from('friendships')
+        .select('*')
+        .or(`and(requester_id.eq.${userId},receiver_id.in.(${userIds.join(',')})),and(receiver_id.eq.${userId},requester_id.in.(${userIds.join(',')}))`);
+
+      const friendshipMap = {};
+      (userFriendships || []).forEach(f => {
+        if (f.requester_id === userId) {
+          friendshipMap[f.receiver_id] = f.status || 'pending';
+        } else if (f.receiver_id === userId) {
+          friendshipMap[f.requester_id] = f.status === 'pending' ? 'incoming' : f.status;
+        }
+      });
+
+      results = results.map(u => ({
+        ...u,
+        friendshipStatus: friendshipMap[u.id] || 'none'
+      }));
+    }
+
+    res.json({ users: results });
+  } catch (err) {
+    console.error('Friend Search Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/friends/request', async (req, res) => {
+  try {
+    const { userId, friendId, requester_id, receiver_id } = req.body;
+    const reqId = userId || requester_id;
+    const recId = friendId || receiver_id;
+
+    if (!reqId || !recId) {
+      return res.status(400).json({ error: 'Both requester and receiver are required' });
+    }
+
+    // Check if relationship already exists
+    const { data: existing } = await supabase
+      .from('friendships')
+      .select('*')
+      .or(`and(requester_id.eq.${reqId},receiver_id.eq.${recId}),and(requester_id.eq.${recId},receiver_id.eq.${reqId})`)
+      .maybeSingle();
+
+    if (existing) {
+      return res.json({ success: true, friendship: existing, alreadyExisted: true });
+    }
+
+    const { data: created, error: insertErr } = await supabase
+      .from('friendships')
+      .insert([{ requester_id: reqId, receiver_id: recId, status: 'pending' }])
+      .select()
+      .single();
+
+    if (insertErr) throw insertErr;
+
+    res.json({ success: true, friendship: created });
+  } catch (err) {
+    console.error('Friend Request Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/friends/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data: friendships, error } = await supabase
+      .from('friendships')
+      .select('*')
+      .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`);
+
+    if (error) throw error;
+    res.json({ friendships: friendships || [] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
