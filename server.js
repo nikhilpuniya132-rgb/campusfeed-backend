@@ -107,7 +107,7 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
       .from('users')
       .select('id')
       .ilike('handle', cleanHandle)
-      .single();
+      .maybeSingle();
 
     let finalHandle = cleanHandle;
     if (existingHandle) {
@@ -133,42 +133,84 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
 
     // Default avatar based on gender
     const defaultAvatar = avatar || (gender === 'girl' ? '🌸' : gender === 'boy' ? '😎' : '✨');
+    const safeEmail = email || `${finalHandle.toLowerCase()}@stkabir.campusfeed.local`;
 
-    // Insert new user into Supabase with all fields
-    const newUser = {
-      email,
-      google_id: googleId,
-      name: name || '',
-      handle: finalHandle,
-      password: password || null,
-      gender: gender || 'boy',
-      grade: parseInt(grade) || 11,
-      school: school || 'St. Kabir Convent Senior Secondary School',
-      district: city || 'Bathinda',
-      profile_pic: profilePic || '',
-      avatar: defaultAvatar,
-      invite_code: inviteCode,
-      my_invite_code: finalHandle,
-      invite_code_used: cleanRef,
-      invites: 0,
-      total_votes: 0,
-      is_pro: false,
-      ring: 'none',
-      bio: `Class ${grade} • St. Kabir`
-    };
-
-    const { data: createdUser, error: insertError } = await supabase
-      .from('users')
-      .insert([newUser])
-      .select()
-      .single();
-
-    if (insertError) {
-      console.error('Insert User Onboarding Error:', insertError);
-      return res.status(400).json({ error: 'Failed to create user profile: ' + insertError.message });
+    // Check if user already exists by email or googleId to support update/re-onboarding safely
+    let existingUser = null;
+    if (email) {
+      const { data: byEmail } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
+      existingUser = byEmail;
+    }
+    if (!existingUser && googleId) {
+      const { data: byGid } = await supabase.from('users').select('*').eq('google_id', googleId).maybeSingle();
+      existingUser = byGid;
     }
 
-    res.json({ user: createdUser });
+    let userResult = null;
+
+    if (existingUser) {
+      const { data: updatedUser, error: updateError } = await supabase
+        .from('users')
+        .update({
+          name: name || existingUser.name,
+          handle: finalHandle,
+          password: password || existingUser.password || null,
+          gender: gender || existingUser.gender || 'boy',
+          grade: parseInt(grade) || existingUser.grade || 11,
+          school: school || existingUser.school || 'St. Kabir Convent Senior Secondary School',
+          district: city || existingUser.district || 'Bathinda',
+          profile_pic: profilePic || existingUser.profile_pic || '',
+          avatar: defaultAvatar,
+          my_invite_code: finalHandle,
+          invite_code_used: existingUser.invite_code_used || cleanRef,
+          bio: existingUser.bio || `Class ${grade} • St. Kabir`
+        })
+        .eq('id', existingUser.id)
+        .select()
+        .single();
+
+      if (updateError) {
+        console.error('Update User Onboarding Error:', updateError);
+        return res.status(400).json({ error: 'Failed to update user profile: ' + updateError.message });
+      }
+      userResult = updatedUser;
+    } else {
+      const newUser = {
+        email: safeEmail,
+        google_id: googleId || null,
+        name: name || '',
+        handle: finalHandle,
+        password: password || null,
+        gender: gender || 'boy',
+        grade: parseInt(grade) || 11,
+        school: school || 'St. Kabir Convent Senior Secondary School',
+        district: city || 'Bathinda',
+        profile_pic: profilePic || '',
+        avatar: defaultAvatar,
+        invite_code: inviteCode,
+        my_invite_code: finalHandle,
+        invite_code_used: cleanRef,
+        invites: 0,
+        total_votes: 0,
+        is_pro: false,
+        ring: 'none',
+        bio: `Class ${grade} • St. Kabir`
+      };
+
+      const { data: createdUser, error: insertError } = await supabase
+        .from('users')
+        .insert([newUser])
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error('Insert User Onboarding Error:', insertError);
+        return res.status(400).json({ error: 'Failed to create user profile: ' + insertError.message });
+      }
+      userResult = createdUser;
+    }
+
+    res.json({ user: userResult });
   } catch (error) {
     console.error('Complete Onboarding Error:', error);
     res.status(500).json({ error: 'Internal server error during onboarding' });
