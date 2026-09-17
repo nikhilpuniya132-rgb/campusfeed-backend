@@ -197,14 +197,40 @@ app.get('/api/classmates/suggested', async (req, res) => {
   }
 });
 
+// --- SESSION COOLDOWNS & VOTE COUNTER (IN-MEMORY & DB RESILIENT TRACKER) ---
+const sessionCooldowns = new Map();
+
+const getUserCooldownState = async (userId, userFromDb) => {
+  let state = sessionCooldowns.get(userId);
+  if (!state) {
+    state = {
+      session_vote_count: userFromDb?.session_vote_count || 0,
+      cooldown_until: userFromDb?.cooldown_until || null
+    };
+    sessionCooldowns.set(userId, state);
+  } else if (userFromDb?.cooldown_until && !state.cooldown_until) {
+    state.cooldown_until = userFromDb.cooldown_until;
+  }
+  // Check if cooldown has expired
+  if (state.cooldown_until && new Date(state.cooldown_until).getTime() <= Date.now()) {
+    state.cooldown_until = null;
+    state.session_vote_count = 0;
+  }
+  return state;
+};
+
 // --- PLAY & VOTING ---
 app.get('/api/play/:userId', async (req, res) => {
   try {
     const { gradeFilter } = req.query;
+    const voterId = req.params.userId;
+    const { data: user } = await supabase.from('users').select('*').eq('id', voterId).maybeSingle();
+    const cooldownState = await getUserCooldownState(voterId, user);
+
     const { data: polls } = await supabase.from('polls').select('*');
     const randomPoll = polls && polls.length > 0 ? polls[Math.floor(Math.random() * polls.length)] : null;
 
-    let query = supabase.from('users').select('id, handle, avatar, profile_pic, grade, is_pro').neq('id', req.params.userId);
+    let query = supabase.from('users').select('id, handle, avatar, profile_pic, grade, is_pro, ring, selected_ring').neq('id', voterId);
     if (gradeFilter && gradeFilter !== 'all') {
       query = query.or(`grade.eq.${gradeFilter},grade.eq.${parseInt(gradeFilter) || gradeFilter}`);
     }
@@ -212,12 +238,17 @@ app.get('/api/play/:userId', async (req, res) => {
     let { data: allUsers } = await query;
     // If fewer than 4 classmates in this grade, augment with whole school to keep game active
     if (!allUsers || allUsers.length < 4) {
-      const { data: schoolUsers } = await supabase.from('users').select('id, handle, avatar, profile_pic, grade, is_pro').neq('id', req.params.userId);
+      const { data: schoolUsers } = await supabase.from('users').select('id, handle, avatar, profile_pic, grade, is_pro, ring, selected_ring').neq('id', voterId);
       allUsers = schoolUsers || allUsers || [];
     }
 
     const shuffledOptions = allUsers ? allUsers.sort(() => 0.5 - Math.random()).slice(0, 4) : [];
-    res.json({ poll: randomPoll, options: shuffledOptions });
+    res.json({
+      poll: randomPoll,
+      options: shuffledOptions,
+      cooldown_until: cooldownState.cooldown_until,
+      session_vote_count: cooldownState.session_vote_count
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -229,8 +260,77 @@ app.post('/api/vote', async (req, res) => {
     await supabase.from('votes').insert([{ poll_id: pollId, voter_id: voterId, receiver_id: receiverId }]);
     const { data: receiver } = await supabase.from('users').select('total_votes').eq('id', receiverId).single();
     if (receiver) await supabase.from('users').update({ total_votes: (receiver.total_votes || 0) + 1 }).eq('id', receiverId);
-    res.json({ success: true });
+
+    // Track voter cooldown & 12-vote session count
+    const { data: voter } = await supabase.from('users').select('*').eq('id', voterId).maybeSingle();
+    let state = await getUserCooldownState(voterId, voter);
+
+    let cooldown_until = state.cooldown_until;
+    let session_vote_count = (state.session_vote_count || 0) + 1;
+
+    // Check 12-vote threshold for free users
+    if (!voter?.is_pro && session_vote_count >= 12) {
+      cooldown_until = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+      session_vote_count = 0;
+    }
+
+    state.session_vote_count = session_vote_count;
+    state.cooldown_until = cooldown_until;
+    sessionCooldowns.set(voterId, state);
+
+    try {
+      await supabase.from('users').update({
+        session_vote_count,
+        cooldown_until
+      }).eq('id', voterId);
+    } catch (_) {}
+
+    res.json({ success: true, session_vote_count, cooldown_until });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Clear Cooldown (Viral Loop Skip or God Mode activation)
+app.post('/api/cooldown/skip', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    sessionCooldowns.set(userId, { session_vote_count: 0, cooldown_until: null });
+    try {
+      await supabase.from('users').update({
+        session_vote_count: 0,
+        cooldown_until: null
+      }).eq('id', userId);
+    } catch (_) {}
+
+    res.json({ success: true, cooldown_until: null, session_vote_count: 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update Aura Ring Route (Saved directly to users table)
+app.post('/api/user/ring', async (req, res) => {
+  try {
+    const { userId, selected_ring } = req.body;
+    if (!userId || !selected_ring) return res.status(400).json({ error: 'Missing userId or selected_ring' });
+
+    const { data: updatedUser, error } = await supabase
+      .from('users')
+      .update({
+        selected_ring,
+        ring: selected_ring
+      })
+      .eq('id', userId)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, user: updatedUser });
+  } catch (err) {
+    console.error('Ring update error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -302,7 +402,11 @@ app.post('/api/pay/verify', async (req, res) => {
     hmac.update(`${razorpay_order_id}|${razorpay_payment_id}`);
     
     if (hmac.digest('hex') === razorpay_signature) {
-      const { data } = await supabase.from('users').update({ is_pro: true, ring: 'gold' }).eq('id', userId).select().single();
+      sessionCooldowns.set(userId, { session_vote_count: 0, cooldown_until: null });
+      const { data } = await supabase.from('users').update({ is_pro: true, ring: 'gold', selected_ring: 'gold' }).eq('id', userId).select().single();
+      try {
+        await supabase.from('users').update({ session_vote_count: 0, cooldown_until: null }).eq('id', userId);
+      } catch (_) {}
       res.json({ success: true, user: data });
     } else {
       res.status(400).json({ success: false, message: 'Invalid signature' });
