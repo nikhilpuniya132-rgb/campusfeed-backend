@@ -89,11 +89,12 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
     email,
     name,
     handle,
-    gender,
+    password,
+    gender = 'boy',
     school = 'St. Kabir Convent Senior Secondary School',
     city = 'Bathinda',
     grade = 11,
-    avatar = '😎',
+    avatar,
     profilePic = '',
     refCode
   } = req.body;
@@ -113,7 +114,7 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
       finalHandle = `${cleanHandle}${Math.floor(100 + Math.random() * 900)}`;
     }
 
-    // Handle invite code
+    // Handle invite code & credit referrer
     const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
     const cleanRef = refCode ? refCode.trim().replace(/^@/, '') : null;
     if (cleanRef) {
@@ -130,15 +131,24 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
       }
     }
 
-    // Insert new user into Supabase
+    // Default avatar based on gender
+    const defaultAvatar = avatar || (gender === 'girl' ? '🌸' : gender === 'boy' ? '😎' : '✨');
+
+    // Insert new user into Supabase with all fields
     const newUser = {
       email,
       google_id: googleId,
+      name: name || '',
       handle: finalHandle,
+      password: password || null,
+      gender: gender || 'boy',
       grade: parseInt(grade) || 11,
+      school: school || 'St. Kabir Convent Senior Secondary School',
+      district: city || 'Bathinda',
       profile_pic: profilePic || '',
-      avatar: avatar || '😎',
+      avatar: defaultAvatar,
       invite_code: inviteCode,
+      my_invite_code: finalHandle,
       invite_code_used: cleanRef,
       invites: 0,
       total_votes: 0,
@@ -162,6 +172,28 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
   } catch (error) {
     console.error('Complete Onboarding Error:', error);
     res.status(500).json({ error: 'Internal server error during onboarding' });
+  }
+});
+
+// --- CLASSMATE SUGGESTIONS FOR ONBOARDING STEP 6 ---
+app.get('/api/classmates/suggested', async (req, res) => {
+  try {
+    const { grade, school, excludeId } = req.query;
+    let query = supabase.from('users').select('id, handle, name, avatar, profile_pic, grade, is_pro, ring');
+    if (excludeId) query = query.neq('id', excludeId);
+    if (grade && grade !== 'all') {
+      query = query.or(`grade.eq.${grade},grade.eq.${parseInt(grade) || grade}`);
+    }
+    let { data: users } = await query.limit(8);
+    if (!users || users.length < 4) {
+      let fallbackQuery = supabase.from('users').select('id, handle, name, avatar, profile_pic, grade, is_pro, ring');
+      if (excludeId) fallbackQuery = fallbackQuery.neq('id', excludeId);
+      const { data: schoolUsers } = await fallbackQuery.limit(8);
+      users = schoolUsers || [];
+    }
+    res.json({ classmates: users || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -284,7 +316,11 @@ app.post('/api/pay/verify', async (req, res) => {
 app.get('/api/inbox/:userId', async (req, res) => {
   try {
     const { data: user } = await supabase.from('users').select('*').eq('id', req.params.userId).single();
-    const { data: votes } = await supabase.from('votes').select(`id, polls(question), users!voter_id(handle, name, avatar, profile_pic, ring, is_pro)`).eq('receiver_id', req.params.userId).order('created_at', { ascending: false });
+    const { data: votes } = await supabase
+      .from('votes')
+      .select(`id, created_at, polls(question), users!voter_id(handle, name, avatar, profile_pic, ring, is_pro, gender)`)
+      .eq('receiver_id', req.params.userId)
+      .order('created_at', { ascending: false });
     
     let inviteCount = 0;
     const cleanHandle = user?.handle?.replace(/^@/, '').trim();
@@ -299,16 +335,35 @@ app.get('/api/inbox/:userId', async (req, res) => {
     const effectiveInvites = Math.max(inviteCount, user?.invites || 0);
     const canReveal = Boolean(user?.is_pro) || effectiveInvites >= 3;
 
-    const messages = (votes || []).map(v => ({
-      voteId: v.id,
-      question: v.polls?.question,
-      voterHandle: canReveal ? v.users?.handle : null,
-      voterName: canReveal ? (v.users?.name || v.users?.handle) : null,
-      voterAvatar: canReveal ? v.users?.avatar : '🔒',
-      voterPic: canReveal ? v.users?.profile_pic : '',
-      isPro: canReveal ? Boolean(v.users?.is_pro) : false,
-      ring: canReveal ? (v.users?.ring || 'none') : 'none'
-    }));
+    const messages = (votes || []).map(v => {
+      const voterGender = v.users?.gender || 'boy';
+
+      if (!canReveal) {
+        // STRICT SECURITY GATING: Mask voter identity completely!
+        // Return ONLY question, voterGender, and voteId
+        return {
+          voteId: v.id,
+          question: v.polls?.question || 'Secret Compliment',
+          voterGender,
+          isLocked: true
+        };
+      } else {
+        // UNLOCKED: Return complete voter profile
+        return {
+          voteId: v.id,
+          question: v.polls?.question || 'Secret Compliment',
+          voterGender,
+          voterHandle: v.users?.handle,
+          voterName: v.users?.name || v.users?.handle,
+          voterAvatar: v.users?.avatar || '😎',
+          voterPic: v.users?.profile_pic || '',
+          isPro: Boolean(v.users?.is_pro),
+          ring: v.users?.ring || 'none',
+          isLocked: false
+        };
+      }
+    });
+
     res.json({ canReveal, effectiveInvites, remaining: Math.max(0, 3 - effectiveInvites), messages });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -363,7 +418,7 @@ const handleRevealRequest = async (voteId, userId, res) => {
     // Fetch the vote with voter and poll details
     const { data: vote, error: voteError } = await supabase
       .from('votes')
-      .select(`id, poll_id, voter_id, users!voter_id(id, handle, name, avatar, profile_pic, ring, is_pro), polls(question)`)
+      .select(`id, poll_id, voter_id, users!voter_id(id, handle, name, avatar, profile_pic, ring, is_pro, gender), polls(question)`)
       .eq('id', voteId)
       .single();
 
@@ -379,6 +434,7 @@ const handleRevealRequest = async (voteId, userId, res) => {
       voterHandle: vote.users?.handle,
       voterAvatar: vote.users?.avatar || '😎',
       voterPic: vote.users?.profile_pic || '',
+      voterGender: vote.users?.gender || 'boy',
       isPro: Boolean(vote.users?.is_pro),
       ring: vote.users?.ring || 'none',
       question: vote.polls?.question
