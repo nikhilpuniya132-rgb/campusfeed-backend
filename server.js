@@ -294,9 +294,8 @@ app.get('/api/inbox/:userId', async (req, res) => {
 });
 
 // --- 3-INVITE REWARD & REVEAL LOGIC ---
-app.post('/api/inbox/reveal', async (req, res) => {
+const handleRevealRequest = async (voteId, userId, res) => {
   try {
-    const { voteId, userId } = req.body;
     if (!voteId || !userId) {
       return res.status(400).json({ error: 'voteId and userId are required' });
     }
@@ -311,7 +310,7 @@ app.post('/api/inbox/reveal', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Query users table to count how many accounts used this user's handle or invite code
+    // Query users table to count how many accounts have invite_code_used matching the requesting user's handle
     let count = 0;
     const cleanHandle = user.handle?.replace(/^@/, '').trim();
     const cleanCode = user.invite_code?.trim();
@@ -328,13 +327,14 @@ app.post('/api/inbox/reveal', async (req, res) => {
     }
     const effectiveInvites = Math.max(count, user.invites || 0);
 
-    // If count < 3 and user is not Pro, return 403 with remaining count
+    // If count < 3 and user is not Pro, return HTTP 403 with { locked: true, remaining: 3 - count }
     if (!user.is_pro && effectiveInvites < 3) {
       const remaining = Math.max(0, 3 - effectiveInvites);
       return res.status(403).json({
-        error: 'Invite requirement not met',
+        locked: true,
         remaining,
-        count: effectiveInvites
+        count: effectiveInvites,
+        error: 'Invite requirement not met'
       });
     }
 
@@ -351,6 +351,7 @@ app.post('/api/inbox/reveal', async (req, res) => {
 
     res.json({
       success: true,
+      locked: false,
       revealed: true,
       voterName: vote.users?.name || vote.users?.handle || 'Classmate',
       voterHandle: vote.users?.handle,
@@ -364,6 +365,17 @@ app.post('/api/inbox/reveal', async (req, res) => {
     console.error('Reveal Error:', err);
     res.status(500).json({ error: err.message });
   }
+};
+
+app.get('/api/inbox/reveal/:voteId', async (req, res) => {
+  const { voteId } = req.params;
+  const userId = req.query.userId;
+  await handleRevealRequest(voteId, userId, res);
+});
+
+app.post('/api/inbox/reveal', async (req, res) => {
+  const { voteId, userId } = req.body;
+  await handleRevealRequest(voteId, userId, res);
 });
 
 // --- IN-APP FRIEND SYSTEM ---
