@@ -158,7 +158,7 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
 
     // Default avatar based on gender
     const defaultAvatar = avatar || (gender === 'girl' ? '🌸' : gender === 'boy' ? '😎' : '✨');
-    const safeEmail = email || `${finalHandle.toLowerCase()}@bathinda.campusfeed.local`;
+    const safeEmail = email || `${finalHandle.toLowerCase()}@bathinda.centerinsider.local`;
 
     // Check if user already exists by email or googleId to support update/re-onboarding safely
     let existingUser = null;
@@ -464,7 +464,7 @@ app.post('/api/vote', async (req, res) => {
           .select('*', { count: 'exact', head: true })
           .eq('voter_id', voterId);
 
-        const isGoogleUser = Boolean(voter.google_id || (voter.email && !voter.email.includes('@stkabir.campusfeed.local')));
+        const isGoogleUser = Boolean(voter.google_id || (voter.email && !voter.email.includes('.local')));
 
         if (totalVotesCount >= 3 && isGoogleUser) {
           const cleanRef = voter.invite_code_used.trim().replace(/^@/, '');
