@@ -475,23 +475,32 @@ app.post('/api/vote', async (req, res) => {
 
           const { data: referrer } = await supabase
             .from('users')
-            .select('id, invites, feed_drops')
+            .select('id, invites, feed_drops, is_batch_captain, batch_captain_admin_override')
             .or(filterParts.join(','))
             .maybeSingle();
 
           if (referrer && referrer.id !== voterId) {
             const updatedInvites = (referrer.invites || 0) + 1;
             const updatedDrops = (referrer.feed_drops || 0) + 50;
+            // Elite Batch Captain requires exactly 25 active recruits OR admin override
+            const isBatchCaptain = updatedInvites >= 25 || Boolean(referrer.batch_captain_admin_override);
 
             try {
               await supabase
                 .from('users')
-                .update({ invites: updatedInvites, feed_drops: updatedDrops })
+                .update({ 
+                  invites: updatedInvites, 
+                  feed_drops: updatedDrops,
+                  is_batch_captain: isBatchCaptain
+                })
                 .eq('id', referrer.id);
             } catch (_) {
               await supabase
                 .from('users')
-                .update({ invites: updatedInvites })
+                .update({ 
+                  invites: updatedInvites,
+                  is_batch_captain: isBatchCaptain
+                })
                 .eq('id', referrer.id);
             }
 
@@ -502,7 +511,7 @@ app.post('/api/vote', async (req, res) => {
                 .eq('id', voterId);
             } catch (_) {}
 
-            console.log(`🛡️ [Anti-Cheat Verified] User @${voter.handle || voterId} reached 3 votes with Google Auth! Referrer @${referrer.id} awarded +1 Invite & +50 Feed Drops.`);
+            console.log(`🛡️ [Anti-Cheat Verified] User @${voter.handle || voterId} reached 3 votes with Google Auth! Referrer @${referrer.id} awarded +1 Invite (Total: ${updatedInvites}/25) & +50 Feed Drops. Elite Status: ${isBatchCaptain}`);
           }
         }
       } catch (refCheckErr) {
@@ -1039,12 +1048,12 @@ app.get('/api/referrals/leaderboard', async (req, res) => {
   try {
     let result = await supabase
       .from('users')
-      .select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, city, district, invites, feed_drops, total_votes, is_pro, ring')
+      .select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, city, district, invites, feed_drops, total_votes, is_pro, ring, is_batch_captain, batch_captain_admin_override')
       .order('invites', { ascending: false })
       .limit(50);
 
     // Resilient fallback if Supabase migration has not been executed yet
-    if (result.error && (result.error.message?.includes('city') || result.error.message?.includes('stream') || result.error.message?.includes('institute') || result.error.message?.includes('feed_drops') || result.error.code === '42703')) {
+    if (result.error && (result.error.message?.includes('city') || result.error.message?.includes('stream') || result.error.message?.includes('institute') || result.error.message?.includes('feed_drops') || result.error.message?.includes('is_batch_captain') || result.error.code === '42703')) {
       result = await supabase
         .from('users')
         .select('id, handle, name, avatar, profile_pic, grade, district, invites, total_votes, is_pro, ring')
@@ -1059,7 +1068,9 @@ app.get('/api/referrals/leaderboard', async (req, res) => {
       stream: u.stream || (u.grade === 12 ? '12th Board' : '11th Medical'),
       institute: u.institute || 'Kapil Institute',
       coaching_hub: u.coaching_hub || 'Ajit Road Hub',
-      feed_drops: u.feed_drops !== undefined && u.feed_drops !== null ? u.feed_drops : (u.invites || 0) * 50
+      feed_drops: u.feed_drops !== undefined && u.feed_drops !== null ? u.feed_drops : (u.invites || 0) * 50,
+      is_batch_captain: Boolean(u.is_batch_captain || u.batch_captain_admin_override || ((u.invites || 0) >= 25)),
+      batch_captain_admin_override: Boolean(u.batch_captain_admin_override)
     }));
     res.json({ success: true, leaderboard: captains });
   } catch (err) {
@@ -1090,17 +1101,16 @@ app.get('/api/explore/trending', async (req, res) => {
     let { data: polls, error: pollErr } = await supabase
       .from('polls')
       .select('id, question')
-      .limit(6);
+      .limit(3);
 
     if (pollErr || !polls || polls.length === 0) {
       polls = [
         { id: 1, question: "Always sleeps through 5 PM Physics?" },
         { id: 2, question: "Most likely to crack NEET on the first attempt?" },
-        { id: 3, question: "Spends more time at the Maggi point than in class?" },
-        { id: 4, question: "Solves HC Verma questions during recess?" },
-        { id: 5, question: "Has handwritten formula cheat sheets everyone borrows?" },
-        { id: 6, question: "Sells their Allen/Aakash test series analysis for samosas?" }
+        { id: 3, question: "Spends more time at the Maggi point than in class?" }
       ];
+    } else {
+      polls = polls.slice(0, 3);
     }
 
     const trending = await Promise.all(
