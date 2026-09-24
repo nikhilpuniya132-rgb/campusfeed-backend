@@ -10,8 +10,22 @@ db.exec(`
     invite_code TEXT UNIQUE NOT NULL,
     referred_by TEXT,
     invites_earned INTEGER DEFAULT 0,
-    bio TEXT DEFAULT '' -- NEW: 50 word limit handled on frontend
+    bio TEXT DEFAULT '',
+    city TEXT DEFAULT 'Bathinda',
+    feed_drops INTEGER DEFAULT 0,
+    referral_rewarded BOOLEAN DEFAULT 0
   );
+
+  try {
+    db.exec("ALTER TABLE users ADD COLUMN city TEXT DEFAULT 'Bathinda'");
+  } catch (_) {}
+  try {
+    db.exec("ALTER TABLE users ADD COLUMN feed_drops INTEGER DEFAULT 0");
+  } catch (_) {}
+  try {
+    db.exec("ALTER TABLE users ADD COLUMN referral_rewarded BOOLEAN DEFAULT 0");
+  } catch (_) {}
+
 
   CREATE TABLE IF NOT EXISTS polls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

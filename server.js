@@ -28,15 +28,20 @@ app.post('/api/auth', async (req, res) => {
     if (!user) {
       const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
       const cleanRef = refCode ? refCode.trim().replace(/^@/, '') : null;
-      if (cleanRef) {
-        const { data: referrer } = await supabase
-          .from('users')
-          .select('*')
-          .or(`invite_code.ilike.${cleanRef},handle.ilike.${cleanRef}`)
-          .maybeSingle();
-        if (referrer) await supabase.from('users').update({ invites: (referrer.invites || 0) + 1 }).eq('id', referrer.id);
-      }
-      const newUser = { handle, password, grade, avatar, invite_code: inviteCode, invite_code_used: cleanRef, invites: 0, total_votes: 0, is_pro: false };
+      const newUser = {
+        handle,
+        password,
+        grade,
+        avatar,
+        invite_code: inviteCode,
+        invite_code_used: cleanRef,
+        invites: 0,
+        feed_drops: 0,
+        referral_rewarded: false,
+        total_votes: 0,
+        is_pro: false,
+        city: 'Bathinda'
+      };
       const { data: createdUser } = await supabase.from('users').insert([newUser]).select().single();
       user = createdUser;
     } else if (user.password !== password) {
@@ -74,6 +79,7 @@ app.post('/api/auth/google', async (req, res) => {
     }
 
     // 3. If user exists, send their profile back to unlock UI
+    user.city = user.city || user.district || 'Bathinda';
     res.json({ isNewUser: false, user });
 
   } catch (error) {
@@ -114,22 +120,9 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
       finalHandle = `${cleanHandle}${Math.floor(100 + Math.random() * 900)}`;
     }
 
-    // Handle invite code & credit referrer
+    // Generate user invite code & record referrer
     const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
     const cleanRef = refCode ? refCode.trim().replace(/^@/, '') : null;
-    if (cleanRef) {
-      const { data: referrer } = await supabase
-        .from('users')
-        .select('*')
-        .or(`invite_code.ilike.${cleanRef},handle.ilike.${cleanRef}`)
-        .maybeSingle();
-      if (referrer) {
-        await supabase
-          .from('users')
-          .update({ invites: (referrer.invites || 0) + 1 })
-          .eq('id', referrer.id);
-      }
-    }
 
     // Default avatar based on gender
     const defaultAvatar = avatar || (gender === 'girl' ? '🌸' : gender === 'boy' ? '😎' : '✨');
@@ -158,7 +151,8 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
           gender: gender || existingUser.gender || 'boy',
           grade: parseInt(grade) || existingUser.grade || 11,
           school: school || existingUser.school || 'St. Kabir Convent Senior Secondary School',
-          district: city || existingUser.district || 'Bathinda',
+          city: city || existingUser.city || existingUser.district || 'Bathinda',
+          district: city || existingUser.city || existingUser.district || 'Bathinda',
           profile_pic: profilePic || existingUser.profile_pic || '',
           avatar: defaultAvatar,
           my_invite_code: finalHandle,
@@ -184,6 +178,7 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
         gender: gender || 'boy',
         grade: parseInt(grade) || 11,
         school: school || 'St. Kabir Convent Senior Secondary School',
+        city: city || 'Bathinda',
         district: city || 'Bathinda',
         profile_pic: profilePic || '',
         avatar: defaultAvatar,
@@ -191,17 +186,32 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
         my_invite_code: finalHandle,
         invite_code_used: cleanRef,
         invites: 0,
+        feed_drops: 0,
+        referral_rewarded: false,
         total_votes: 0,
         is_pro: false,
         ring: 'none',
         bio: `Class ${grade} • St. Kabir`
       };
 
-      const { data: createdUser, error: insertError } = await supabase
+      let { data: createdUser, error: insertError } = await supabase
         .from('users')
         .insert([newUser])
         .select()
         .single();
+
+      if (insertError && (insertError.message?.includes('feed_drops') || insertError.message?.includes('city') || insertError.message?.includes('referral_rewarded'))) {
+        delete newUser.feed_drops;
+        delete newUser.referral_rewarded;
+        delete newUser.city;
+        const retry = await supabase
+          .from('users')
+          .insert([newUser])
+          .select()
+          .single();
+        createdUser = retry.data;
+        insertError = retry.error;
+      }
 
       if (insertError) {
         console.error('Insert User Onboarding Error:', insertError);
@@ -349,6 +359,60 @@ app.post('/api/vote', async (req, res) => {
       }).eq('id', voterId);
     } catch (_) {}
 
+    // --- ANTI-CHEAT REFERRAL VERIFICATION (3-POLL + GOOGLE AUTH RULE) ---
+    if (voter && voter.invite_code_used && !voter.referral_rewarded) {
+      try {
+        const { count: totalVotesCount } = await supabase
+          .from('votes')
+          .select('*', { count: 'exact', head: true })
+          .eq('voter_id', voterId);
+
+        const isGoogleUser = Boolean(voter.google_id || (voter.email && !voter.email.includes('@stkabir.campusfeed.local')));
+
+        if (totalVotesCount >= 3 && isGoogleUser) {
+          const cleanRef = voter.invite_code_used.trim().replace(/^@/, '');
+          const filterParts = [`invite_code.ilike.${cleanRef}`, `handle.ilike.${cleanRef}`];
+          if (!isNaN(cleanRef) || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cleanRef)) {
+            filterParts.push(`id.eq.${cleanRef}`);
+          }
+
+          const { data: referrer } = await supabase
+            .from('users')
+            .select('id, invites, feed_drops')
+            .or(filterParts.join(','))
+            .maybeSingle();
+
+          if (referrer && referrer.id !== voterId) {
+            const updatedInvites = (referrer.invites || 0) + 1;
+            const updatedDrops = (referrer.feed_drops || 0) + 50;
+
+            try {
+              await supabase
+                .from('users')
+                .update({ invites: updatedInvites, feed_drops: updatedDrops })
+                .eq('id', referrer.id);
+            } catch (_) {
+              await supabase
+                .from('users')
+                .update({ invites: updatedInvites })
+                .eq('id', referrer.id);
+            }
+
+            try {
+              await supabase
+                .from('users')
+                .update({ referral_rewarded: true })
+                .eq('id', voterId);
+            } catch (_) {}
+
+            console.log(`🛡️ [Anti-Cheat Verified] User @${voter.handle || voterId} reached 3 votes with Google Auth! Referrer @${referrer.id} awarded +1 Invite & +50 Feed Drops.`);
+          }
+        }
+      } catch (refCheckErr) {
+        console.error('Referral verification check error:', refCheckErr);
+      }
+    }
+
     res.json({ success: true, session_vote_count, cooldown_until });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -415,22 +479,39 @@ app.post('/api/user/ring', async (req, res) => {
 // --- PROFILE MANAGEMENT ---
 app.put('/api/profile/:userId', async (req, res) => {
   try {
-    const { bio, avatar, ring, profile_pic, grade } = req.body;
+    const { bio, avatar, ring, profile_pic, grade, city } = req.body;
     const updateData = {};
     if (bio !== undefined) updateData.bio = bio;
     if (avatar !== undefined) updateData.avatar = avatar;
     if (ring !== undefined) updateData.ring = ring;
     if (profile_pic !== undefined) updateData.profile_pic = profile_pic;
     if (grade !== undefined) updateData.grade = grade.toString();
+    if (city !== undefined) {
+      updateData.city = city;
+      updateData.district = city;
+    }
 
-    const { data: updatedUser, error } = await supabase
+    let { data: updatedUser, error } = await supabase
       .from('users')
       .update(updateData)
       .eq('id', req.params.userId)
       .select()
       .single();
 
+    if (error && (error.message?.includes('city') || error.code === '42703')) {
+      delete updateData.city;
+      const retry = await supabase
+        .from('users')
+        .update(updateData)
+        .eq('id', req.params.userId)
+        .select()
+        .single();
+      updatedUser = retry.data;
+      error = retry.error;
+    }
+
     if (error) throw error;
+    if (updatedUser) updatedUser.city = updatedUser.city || updatedUser.district || city || 'Bathinda';
     res.json({ success: true, user: updatedUser });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -838,6 +919,37 @@ app.get('/api/explore/leaderboard', async (req, res) => {
     const { data: leaderboard } = await supabase.from('users').select('id, handle, avatar, profile_pic, total_votes, is_pro').order('total_votes', { ascending: false }).limit(30);
     res.json({ leaderboard: leaderboard || [] });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- BATCH CAPTAINS (REFERRAL ENGINE) LEADERBOARD ---
+app.get('/api/referrals/leaderboard', async (req, res) => {
+  try {
+    let result = await supabase
+      .from('users')
+      .select('id, handle, name, avatar, profile_pic, grade, city, district, invites, feed_drops, total_votes, is_pro, ring')
+      .order('invites', { ascending: false })
+      .limit(50);
+
+    // Resilient fallback if Supabase migration has not been executed yet
+    if (result.error && (result.error.message?.includes('city') || result.error.message?.includes('feed_drops') || result.error.code === '42703')) {
+      result = await supabase
+        .from('users')
+        .select('id, handle, name, avatar, profile_pic, grade, district, invites, total_votes, is_pro, ring')
+        .order('invites', { ascending: false })
+        .limit(50);
+    }
+
+    if (result.error) throw result.error;
+    const captains = (result.data || []).map(u => ({
+      ...u,
+      city: u.city || u.district || 'Bathinda',
+      feed_drops: u.feed_drops !== undefined && u.feed_drops !== null ? u.feed_drops : (u.invites || 0) * 50
+    }));
+    res.json({ success: true, leaderboard: captains });
+  } catch (err) {
+    console.error('Batch Captains Leaderboard Error:', err);
     res.status(500).json({ error: err.message });
   }
 });
