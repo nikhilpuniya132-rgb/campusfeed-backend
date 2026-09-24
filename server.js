@@ -22,16 +22,19 @@ const razorpay = new Razorpay({
 // --- AUTHENTICATION ---
 app.post('/api/auth', async (req, res) => {
   try {
-    const { handle, password, grade, avatar, refCode } = req.body;
+    const { handle, password, grade, avatar, refCode, institute, coaching_hub, coachingHub, stream } = req.body;
     let { data: user } = await supabase.from('users').select('*').eq('handle', handle).single();
 
     if (!user) {
       const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
       const cleanRef = refCode ? refCode.trim().replace(/^@/, '') : null;
+      const finalInstitute = institute || 'Kapil Institute';
+      const finalHub = coaching_hub || coachingHub || 'Ajit Road Hub';
+      const finalStream = stream || '11th Medical';
       const newUser = {
         handle,
         password,
-        grade,
+        grade: parseInt(grade) || 11,
         avatar,
         invite_code: inviteCode,
         invite_code_used: cleanRef,
@@ -40,12 +43,31 @@ app.post('/api/auth', async (req, res) => {
         referral_rewarded: false,
         total_votes: 0,
         is_pro: false,
-        city: 'Bathinda'
+        city: 'Bathinda',
+        district: 'Bathinda',
+        institute: finalInstitute,
+        school: finalInstitute,
+        coaching_hub: finalHub,
+        stream: finalStream,
+        bio: `${finalInstitute} • ${finalStream}`
       };
-      const { data: createdUser } = await supabase.from('users').insert([newUser]).select().single();
+      let { data: createdUser, error: insertErr } = await supabase.from('users').insert([newUser]).select().single();
+      if (insertErr && (insertErr.message?.includes('institute') || insertErr.message?.includes('coaching_hub') || insertErr.message?.includes('stream'))) {
+        delete newUser.institute;
+        delete newUser.coaching_hub;
+        delete newUser.stream;
+        const retry = await supabase.from('users').insert([newUser]).select().single();
+        createdUser = retry.data;
+      }
       user = createdUser;
     } else if (user.password !== password) {
       return res.status(401).json({ error: 'Incorrect password' });
+    }
+    if (user) {
+      user.city = 'Bathinda';
+      user.institute = user.institute || 'Kapil Institute';
+      user.coaching_hub = user.coaching_hub || 'Ajit Road Hub';
+      user.stream = user.stream || '11th Medical';
     }
     res.json({ user });
   } catch (err) {
@@ -78,8 +100,11 @@ app.post('/api/auth/google', async (req, res) => {
       });
     }
 
-    // 3. If user exists, send their profile back to unlock UI
-    user.city = user.city || user.district || 'Bathinda';
+    // 3. If user exists, send their profile back to unlock UI with coaching taxonomy
+    user.city = 'Bathinda';
+    user.institute = user.institute || 'Kapil Institute';
+    user.coaching_hub = user.coaching_hub || 'Ajit Road Hub';
+    user.stream = user.stream || '11th Medical';
     res.json({ isNewUser: false, user });
 
   } catch (error) {
@@ -97,7 +122,11 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
     handle,
     password,
     gender = 'boy',
-    school = 'St. Kabir Convent Senior Secondary School',
+    school,
+    institute = 'Kapil Institute',
+    coaching_hub,
+    coachingHub = 'Ajit Road Hub',
+    stream = '11th Medical',
     city = 'Bathinda',
     grade = 11,
     avatar,
@@ -107,6 +136,9 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
 
   try {
     const cleanHandle = (handle || name || 'campus').replace(/^@/, '').trim();
+    const finalInstitute = institute || school || 'Kapil Institute';
+    const finalHub = coaching_hub || coachingHub || 'Ajit Road Hub';
+    const finalStream = stream || '11th Medical';
 
     // Check if handle is already taken
     const { data: existingHandle } = await supabase
@@ -126,7 +158,7 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
 
     // Default avatar based on gender
     const defaultAvatar = avatar || (gender === 'girl' ? '🌸' : gender === 'boy' ? '😎' : '✨');
-    const safeEmail = email || `${finalHandle.toLowerCase()}@stkabir.campusfeed.local`;
+    const safeEmail = email || `${finalHandle.toLowerCase()}@bathinda.campusfeed.local`;
 
     // Check if user already exists by email or googleId to support update/re-onboarding safely
     let existingUser = null;
@@ -142,26 +174,45 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
     let userResult = null;
 
     if (existingUser) {
-      const { data: updatedUser, error: updateError } = await supabase
+      const updatePayload = {
+        name: name || existingUser.name,
+        handle: finalHandle,
+        password: password || existingUser.password || null,
+        gender: gender || existingUser.gender || 'boy',
+        grade: parseInt(grade) || existingUser.grade || 11,
+        school: finalInstitute,
+        institute: finalInstitute,
+        coaching_hub: finalHub,
+        stream: finalStream,
+        city: 'Bathinda',
+        district: 'Bathinda',
+        profile_pic: profilePic || existingUser.profile_pic || '',
+        avatar: defaultAvatar,
+        my_invite_code: finalHandle,
+        invite_code_used: existingUser.invite_code_used || cleanRef,
+        bio: existingUser.bio || `${finalInstitute} • ${finalStream}`
+      };
+
+      let { data: updatedUser, error: updateError } = await supabase
         .from('users')
-        .update({
-          name: name || existingUser.name,
-          handle: finalHandle,
-          password: password || existingUser.password || null,
-          gender: gender || existingUser.gender || 'boy',
-          grade: parseInt(grade) || existingUser.grade || 11,
-          school: school || existingUser.school || 'St. Kabir Convent Senior Secondary School',
-          city: city || existingUser.city || existingUser.district || 'Bathinda',
-          district: city || existingUser.city || existingUser.district || 'Bathinda',
-          profile_pic: profilePic || existingUser.profile_pic || '',
-          avatar: defaultAvatar,
-          my_invite_code: finalHandle,
-          invite_code_used: existingUser.invite_code_used || cleanRef,
-          bio: existingUser.bio || `Class ${grade} • St. Kabir`
-        })
+        .update(updatePayload)
         .eq('id', existingUser.id)
         .select()
         .single();
+
+      if (updateError && (updateError.message?.includes('institute') || updateError.message?.includes('coaching_hub') || updateError.message?.includes('stream'))) {
+        delete updatePayload.institute;
+        delete updatePayload.coaching_hub;
+        delete updatePayload.stream;
+        const retry = await supabase
+          .from('users')
+          .update(updatePayload)
+          .eq('id', existingUser.id)
+          .select()
+          .single();
+        updatedUser = retry.data;
+        updateError = retry.error;
+      }
 
       if (updateError) {
         console.error('Update User Onboarding Error:', updateError);
@@ -177,9 +228,12 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
         password: password || null,
         gender: gender || 'boy',
         grade: parseInt(grade) || 11,
-        school: school || 'St. Kabir Convent Senior Secondary School',
-        city: city || 'Bathinda',
-        district: city || 'Bathinda',
+        school: finalInstitute,
+        institute: finalInstitute,
+        coaching_hub: finalHub,
+        stream: finalStream,
+        city: 'Bathinda',
+        district: 'Bathinda',
         profile_pic: profilePic || '',
         avatar: defaultAvatar,
         invite_code: inviteCode,
@@ -191,7 +245,7 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
         total_votes: 0,
         is_pro: false,
         ring: 'none',
-        bio: `Class ${grade} • St. Kabir`
+        bio: `${finalInstitute} • ${finalStream}`
       };
 
       let { data: createdUser, error: insertError } = await supabase
@@ -200,10 +254,13 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
         .select()
         .single();
 
-      if (insertError && (insertError.message?.includes('feed_drops') || insertError.message?.includes('city') || insertError.message?.includes('referral_rewarded'))) {
+      if (insertError && (insertError.message?.includes('feed_drops') || insertError.message?.includes('city') || insertError.message?.includes('institute') || insertError.message?.includes('coaching_hub') || insertError.message?.includes('stream'))) {
         delete newUser.feed_drops;
         delete newUser.referral_rewarded;
         delete newUser.city;
+        delete newUser.institute;
+        delete newUser.coaching_hub;
+        delete newUser.stream;
         const retry = await supabase
           .from('users')
           .insert([newUser])
@@ -220,6 +277,13 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
       userResult = createdUser;
     }
 
+    if (userResult) {
+      userResult.city = 'Bathinda';
+      userResult.institute = userResult.institute || finalInstitute;
+      userResult.coaching_hub = userResult.coaching_hub || finalHub;
+      userResult.stream = userResult.stream || finalStream;
+    }
+
     res.json({ user: userResult });
   } catch (error) {
     console.error('Complete Onboarding Error:', error);
@@ -228,38 +292,40 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
 });
 
 // --- CLASSMATE SUGGESTIONS FOR ONBOARDING STEP 6 ---
-const ST_KABIR_FALLBACK_CLASSMATES = [
-  { id: 'sk-seed-1', name: 'Gursharan Singh', handle: 'gursharan', avatar: '😎', mutual: 18, grade: 11 },
-  { id: 'sk-seed-2', name: 'Piyush', handle: 'piyush', avatar: '🔥', mutual: 24, grade: 11 },
-  { id: 'sk-seed-3', name: 'Harsh Pawar', handle: 'harsh_pawar', avatar: '🦊', mutual: 15, grade: 11 },
-  { id: 'sk-seed-4', name: 'Altaf', handle: 'altaf', avatar: '👑', mutual: 21, grade: 11 },
-  { id: 'sk-seed-5', name: 'Karam', handle: 'karam', avatar: '⚡', mutual: 14, grade: 11 },
-  { id: 'sk-seed-6', name: 'Harman Kaur', handle: 'harman_k', avatar: '🌸', mutual: 19, grade: 11 },
-  { id: 'sk-seed-7', name: 'Navjot Singh', handle: 'navjot_s', avatar: '💫', mutual: 16, grade: 11 },
-  { id: 'sk-seed-8', name: 'Simran', handle: 'simran_k', avatar: '✨', mutual: 11, grade: 11 },
-  { id: 'sk-seed-9', name: 'Khushi', handle: 'khushi', avatar: '💖', mutual: 13, grade: 11 },
-  { id: 'sk-seed-10', name: 'Arjun', handle: 'arjun_v', avatar: '🏀', mutual: 17, grade: 11 }
+const BATHINDA_COACHING_FALLBACK_PEERS = [
+  { id: 'bti-seed-1', name: 'Gursharan Singh', handle: 'gursharan', avatar: '😎', mutual: 18, grade: 11, stream: '11th Medical', institute: 'Kapil Institute', coaching_hub: 'Ajit Road Hub' },
+  { id: 'bti-seed-2', name: 'Piyush Bansal', handle: 'piyush_b', avatar: '🔥', mutual: 24, grade: 11, stream: '11th Non-Med', institute: 'UNCRAM', coaching_hub: 'Ajit Road Hub' },
+  { id: 'bti-seed-3', name: 'Harsh Pawar', handle: 'harsh_pawar', avatar: '🦊', mutual: 15, grade: 12, stream: '12th Board', institute: 'Aakash Institute', coaching_hub: '100 Feet Road Hub' },
+  { id: 'bti-seed-4', name: 'Altaf Khan', handle: 'altaf', avatar: '👑', mutual: 21, grade: 12, stream: 'NEET Droppers', institute: 'ALLEN Career Institute', coaching_hub: 'Other Bathinda Locations' },
+  { id: 'bti-seed-5', name: 'Karamveer Brar', handle: 'karam_brar', avatar: '⚡', mutual: 14, grade: 11, stream: '11th Medical', institute: 'Prof J.S Brar Institute', coaching_hub: 'Ajit Road Hub' },
+  { id: 'bti-seed-6', name: 'Harman Kaur', handle: 'harman_k', avatar: '🌸', mutual: 19, grade: 11, stream: '11th Medical', institute: 'Kapil Institute', coaching_hub: 'Ajit Road Hub' },
+  { id: 'bti-seed-7', name: 'Navjot Singh', handle: 'navjot_s', avatar: '💫', mutual: 16, grade: 11, stream: '11th Non-Med', institute: 'REAL INSTITUTE OF MATHS', coaching_hub: 'Ajit Road Hub' },
+  { id: 'bti-seed-8', name: 'Simran Dhillon', handle: 'simran_d', avatar: '✨', mutual: 11, grade: 12, stream: '12th Board', institute: 'Tanya Commerce Institute', coaching_hub: 'Ajit Road Hub' },
+  { id: 'bti-seed-9', name: 'Khushi Jindal', handle: 'khushi_j', avatar: '💖', mutual: 13, grade: 11, stream: '11th Medical', institute: 'Mahak Science Classes', coaching_hub: 'Ajit Road Hub' },
+  { id: 'bti-seed-10', name: 'Arjun Sharma', handle: 'arjun_phy', avatar: '🏀', mutual: 17, grade: 12, stream: 'NEET Droppers', institute: 'Arjun Physics Classes', coaching_hub: 'Ajit Road Hub' }
 ];
 
 app.get('/api/classmates/suggested', async (req, res) => {
   try {
-    const { grade, school, excludeId } = req.query;
-    let query = supabase.from('users').select('id, handle, name, avatar, profile_pic, grade, is_pro, ring');
+    const { grade, stream, school, excludeId } = req.query;
+    let query = supabase.from('users').select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, is_pro, ring');
     if (excludeId) query = query.neq('id', excludeId);
-    if (grade && grade !== 'all') {
+    if (stream && stream !== 'all' && stream !== 'All Bathinda') {
+      query = query.ilike('stream', `%${stream}%`);
+    } else if (grade && grade !== 'all') {
       query = query.or(`grade.eq.${grade},grade.eq.${parseInt(grade) || grade}`);
     }
     let { data: users } = await query.limit(10);
     if (!users || users.length < 6) {
-      let fallbackQuery = supabase.from('users').select('id, handle, name, avatar, profile_pic, grade, is_pro, ring');
+      let fallbackQuery = supabase.from('users').select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, is_pro, ring');
       if (excludeId) fallbackQuery = fallbackQuery.neq('id', excludeId);
       const { data: schoolUsers } = await fallbackQuery.limit(10);
       users = schoolUsers || [];
     }
 
-    // Merge fallback seed classmates if needed to ensure a full list matching the screenshot
+    // Merge fallback seed peers if needed to ensure a full list matching the coaching hubs
     const finalUsers = [...(users || [])];
-    ST_KABIR_FALLBACK_CLASSMATES.forEach(seed => {
+    BATHINDA_COACHING_FALLBACK_PEERS.forEach(seed => {
       if (finalUsers.length < 10 && !finalUsers.some(u => u.handle === seed.handle || u.name === seed.name)) {
         finalUsers.push(seed);
       }
@@ -267,7 +333,7 @@ app.get('/api/classmates/suggested', async (req, res) => {
 
     res.json({ classmates: finalUsers });
   } catch (err) {
-    res.status(500).json({ error: err.message, classmates: ST_KABIR_FALLBACK_CLASSMATES });
+    res.status(500).json({ error: err.message, classmates: BATHINDA_COACHING_FALLBACK_PEERS });
   }
 });
 
@@ -294,26 +360,57 @@ const getUserCooldownState = async (userId, userFromDb) => {
 };
 
 // --- PLAY & VOTING ---
+const TUITION_POLLS_FALLBACK = [
+  { id: 1, question: "Always sleeps through 5 PM Physics?", is_crush_poll: false },
+  { id: 2, question: "Most likely to crack NEET on the first attempt?", is_crush_poll: false },
+  { id: 3, question: "Spends more time at the Maggi point than in class?", is_crush_poll: false },
+  { id: 4, question: "Solves HC Verma questions during recess?", is_crush_poll: false },
+  { id: 5, question: "Has handwritten formula cheat sheets everyone borrows?", is_crush_poll: false },
+  { id: 6, question: "Sells their Allen/Aakash test series analysis for samosas?", is_crush_poll: false },
+  { id: 7, question: "Secret crush in the coaching batch", is_crush_poll: true },
+  { id: 8, question: "Biggest drip at Ajit Road", is_crush_poll: false }
+];
+
 app.get('/api/play/:userId', async (req, res) => {
   try {
-    const { gradeFilter } = req.query;
+    const { gradeFilter, streamFilter } = req.query;
     const voterId = req.params.userId;
     const { data: user } = await supabase.from('users').select('*').eq('id', voterId).maybeSingle();
     const cooldownState = await getUserCooldownState(voterId, user);
 
-    const { data: polls } = await supabase.from('polls').select('*');
-    const randomPoll = polls && polls.length > 0 ? polls[Math.floor(Math.random() * polls.length)] : null;
+    let { data: polls } = await supabase.from('polls').select('*');
+    if (!polls || polls.length === 0) {
+      polls = TUITION_POLLS_FALLBACK;
+    }
+    const randomPoll = polls[Math.floor(Math.random() * polls.length)];
 
-    let query = supabase.from('users').select('id, handle, avatar, profile_pic, grade, is_pro, ring, selected_ring').neq('id', voterId);
-    if (gradeFilter && gradeFilter !== 'all') {
-      query = query.or(`grade.eq.${gradeFilter},grade.eq.${parseInt(gradeFilter) || gradeFilter}`);
+    let query = supabase.from('users').select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, is_pro, ring, selected_ring').neq('id', voterId);
+    
+    const activeFilter = streamFilter || gradeFilter;
+    if (activeFilter && activeFilter !== 'all' && activeFilter !== 'All Bathinda') {
+      if (activeFilter.includes('Med') || activeFilter.includes('Board') || activeFilter.includes('Dropper') || activeFilter.includes('Commerce')) {
+        query = query.ilike('stream', `%${activeFilter}%`);
+      } else {
+        query = query.or(`grade.eq.${activeFilter},grade.eq.${parseInt(activeFilter) || activeFilter}`);
+      }
     }
 
     let { data: allUsers } = await query;
-    // If fewer than 4 classmates in this grade, augment with whole school to keep game active
+    // If fewer than 4 peers in this filter, augment with network
     if (!allUsers || allUsers.length < 4) {
-      const { data: schoolUsers } = await supabase.from('users').select('id, handle, avatar, profile_pic, grade, is_pro, ring, selected_ring').neq('id', voterId);
-      allUsers = schoolUsers || allUsers || [];
+      const { data: networkUsers } = await supabase.from('users').select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, is_pro, ring, selected_ring').neq('id', voterId);
+      allUsers = networkUsers || allUsers || [];
+    }
+
+    // Merge fallback peers if local database has fewer than 4 students
+    if (!allUsers || allUsers.length < 4) {
+      const candidates = [...(allUsers || [])];
+      BATHINDA_COACHING_FALLBACK_PEERS.forEach(p => {
+        if (!candidates.some(c => c.handle === p.handle) && candidates.length < 4) {
+          candidates.push(p);
+        }
+      });
+      allUsers = candidates;
     }
 
     const shuffledOptions = allUsers ? allUsers.sort(() => 0.5 - Math.random()).slice(0, 4) : [];
@@ -479,17 +576,23 @@ app.post('/api/user/ring', async (req, res) => {
 // --- PROFILE MANAGEMENT ---
 app.put('/api/profile/:userId', async (req, res) => {
   try {
-    const { bio, avatar, ring, profile_pic, grade, city } = req.body;
+    const { bio, avatar, ring, profile_pic, grade, city, institute, coaching_hub, coachingHub, stream } = req.body;
     const updateData = {};
     if (bio !== undefined) updateData.bio = bio;
     if (avatar !== undefined) updateData.avatar = avatar;
     if (ring !== undefined) updateData.ring = ring;
     if (profile_pic !== undefined) updateData.profile_pic = profile_pic;
     if (grade !== undefined) updateData.grade = grade.toString();
-    if (city !== undefined) {
-      updateData.city = city;
-      updateData.district = city;
+    if (institute !== undefined) {
+      updateData.institute = institute;
+      updateData.school = institute;
     }
+    if (coaching_hub !== undefined || coachingHub !== undefined) {
+      updateData.coaching_hub = coaching_hub || coachingHub;
+    }
+    if (stream !== undefined) updateData.stream = stream;
+    updateData.city = 'Bathinda';
+    updateData.district = 'Bathinda';
 
     let { data: updatedUser, error } = await supabase
       .from('users')
@@ -498,8 +601,11 @@ app.put('/api/profile/:userId', async (req, res) => {
       .select()
       .single();
 
-    if (error && (error.message?.includes('city') || error.code === '42703')) {
+    if (error && (error.message?.includes('city') || error.message?.includes('institute') || error.message?.includes('coaching_hub') || error.message?.includes('stream') || error.code === '42703')) {
       delete updateData.city;
+      delete updateData.institute;
+      delete updateData.coaching_hub;
+      delete updateData.stream;
       const retry = await supabase
         .from('users')
         .update(updateData)
@@ -511,7 +617,12 @@ app.put('/api/profile/:userId', async (req, res) => {
     }
 
     if (error) throw error;
-    if (updatedUser) updatedUser.city = updatedUser.city || updatedUser.district || city || 'Bathinda';
+    if (updatedUser) {
+      updatedUser.city = 'Bathinda';
+      updatedUser.institute = updatedUser.institute || institute || 'Kapil Institute';
+      updatedUser.coaching_hub = updatedUser.coaching_hub || coaching_hub || coachingHub || 'Ajit Road Hub';
+      updatedUser.stream = updatedUser.stream || stream || '11th Medical';
+    }
     res.json({ success: true, user: updatedUser });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -928,12 +1039,12 @@ app.get('/api/referrals/leaderboard', async (req, res) => {
   try {
     let result = await supabase
       .from('users')
-      .select('id, handle, name, avatar, profile_pic, grade, city, district, invites, feed_drops, total_votes, is_pro, ring')
+      .select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, city, district, invites, feed_drops, total_votes, is_pro, ring')
       .order('invites', { ascending: false })
       .limit(50);
 
     // Resilient fallback if Supabase migration has not been executed yet
-    if (result.error && (result.error.message?.includes('city') || result.error.message?.includes('feed_drops') || result.error.code === '42703')) {
+    if (result.error && (result.error.message?.includes('city') || result.error.message?.includes('stream') || result.error.message?.includes('institute') || result.error.message?.includes('feed_drops') || result.error.code === '42703')) {
       result = await supabase
         .from('users')
         .select('id, handle, name, avatar, profile_pic, grade, district, invites, total_votes, is_pro, ring')
@@ -944,7 +1055,10 @@ app.get('/api/referrals/leaderboard', async (req, res) => {
     if (result.error) throw result.error;
     const captains = (result.data || []).map(u => ({
       ...u,
-      city: u.city || u.district || 'Bathinda',
+      city: 'Bathinda',
+      stream: u.stream || (u.grade === 12 ? '12th Board' : '11th Medical'),
+      institute: u.institute || 'Kapil Institute',
+      coaching_hub: u.coaching_hub || 'Ajit Road Hub',
       feed_drops: u.feed_drops !== undefined && u.feed_drops !== null ? u.feed_drops : (u.invites || 0) * 50
     }));
     res.json({ success: true, leaderboard: captains });
@@ -973,13 +1087,21 @@ app.get('/api/explore/legends', async (req, res) => {
 
 app.get('/api/explore/trending', async (req, res) => {
   try {
-    const { data: polls, error: pollErr } = await supabase
+    let { data: polls, error: pollErr } = await supabase
       .from('polls')
       .select('id, question')
       .limit(6);
 
-    if (pollErr) throw pollErr;
-    if (!polls || polls.length === 0) return res.json({ trending: [] });
+    if (pollErr || !polls || polls.length === 0) {
+      polls = [
+        { id: 1, question: "Always sleeps through 5 PM Physics?" },
+        { id: 2, question: "Most likely to crack NEET on the first attempt?" },
+        { id: 3, question: "Spends more time at the Maggi point than in class?" },
+        { id: 4, question: "Solves HC Verma questions during recess?" },
+        { id: 5, question: "Has handwritten formula cheat sheets everyone borrows?" },
+        { id: 6, question: "Sells their Allen/Aakash test series analysis for samosas?" }
+      ];
+    }
 
     const trending = await Promise.all(
       polls.map(async (poll) => {
