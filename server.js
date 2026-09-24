@@ -663,7 +663,9 @@ app.get('/api/profile/public/:userId', async (req, res) => {
 // --- RAZORPAY GATEWAY ---
 app.post('/api/pay/order', async (req, res) => {
   try {
-    const { userId, amount = 9900 } = req.body; // 9900 paise = 99 INR
+    const { userId } = req.body;
+    // Strictly enforce ₹99/week (9900 paise) as the ONLY available subscription offering
+    const amount = 9900;
     const order = await razorpay.orders.create({ amount, currency: 'INR', receipt: `rcpt_${userId}_${Date.now()}` });
     res.json(order);
   } catch (error) {
