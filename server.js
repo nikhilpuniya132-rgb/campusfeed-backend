@@ -664,8 +664,9 @@ app.get('/api/profile/public/:userId', async (req, res) => {
 app.post('/api/pay/order', async (req, res) => {
   try {
     const { userId } = req.body;
-    // Strictly enforce ₹99/week (9900 paise) as the ONLY available subscription offering
-    const amount = 9900;
+    // Support both ₹99/week (9900 paise) and ₹149/month (14900 paise) subscription offerings
+    const requestedAmount = Number(req.body.amount);
+    const amount = (requestedAmount === 14900 || requestedAmount === 9900) ? requestedAmount : 9900;
     const order = await razorpay.orders.create({ amount, currency: 'INR', receipt: `rcpt_${userId}_${Date.now()}` });
     res.json(order);
   } catch (error) {
