@@ -207,7 +207,6 @@ app.post('/api/auth', async (req, res) => {
         referral_rewarded: false,
         total_votes: 0,
         is_pro: false,
-        city: 'Bathinda',
         district: 'Bathinda',
         institute: finalInstitute,
         school: finalInstitute,
@@ -367,7 +366,6 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
         institute: finalInstitute,
         coaching_hub: finalHub,
         stream: finalStream,
-        city: 'Bathinda',
         district: 'Bathinda',
         profile_pic: profilePic || existingUser.profile_pic || '',
         avatar: defaultAvatar,
@@ -417,7 +415,6 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
         institute: finalInstitute,
         coaching_hub: finalHub,
         stream: finalStream,
-        city: 'Bathinda',
         district: 'Bathinda',
         profile_pic: profilePic || '',
         avatar: defaultAvatar,
@@ -554,8 +551,14 @@ app.get('/api/play/:userId', async (req, res) => {
     }
     const randomPoll = polls[Math.floor(Math.random() * polls.length)];
 
+    const targetInstitute = (req.query.institute || user?.institute || '').trim();
     let query = supabase.from('users').select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, is_pro, ring, selected_ring').neq('id', voterId);
     
+    // Strict multi-tenant institute silo
+    if (targetInstitute) {
+      query = query.eq('institute', targetInstitute);
+    }
+
     const activeFilter = streamFilter || gradeFilter;
     if (activeFilter && activeFilter !== 'all' && activeFilter !== 'All Bathinda') {
       if (activeFilter.includes('Med') || activeFilter.includes('Board') || activeFilter.includes('Dropper') || activeFilter.includes('Commerce')) {
@@ -566,24 +569,10 @@ app.get('/api/play/:userId', async (req, res) => {
     }
 
     let { data: allUsers } = await query;
-    // If fewer than 4 peers in this filter, augment with network
-    if (!allUsers || allUsers.length < 4) {
-      const { data: networkUsers } = await supabase.from('users').select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, is_pro, ring, selected_ring').neq('id', voterId);
-      allUsers = networkUsers || allUsers || [];
-    }
+    // Strictly isolate: do not augment with rival institutes or other schools
+    const instituteUsers = (allUsers || []).filter(u => !targetInstitute || u.institute === targetInstitute);
 
-    // Merge fallback peers if local database has fewer than 4 students
-    if (!allUsers || allUsers.length < 4) {
-      const candidates = [...(allUsers || [])];
-      BATHINDA_COACHING_FALLBACK_PEERS.forEach(p => {
-        if (!candidates.some(c => c.handle === p.handle) && candidates.length < 4) {
-          candidates.push(p);
-        }
-      });
-      allUsers = candidates;
-    }
-
-    const shuffledOptions = allUsers ? allUsers.sort(() => 0.5 - Math.random()).slice(0, 4) : [];
+    const shuffledOptions = instituteUsers.sort(() => 0.5 - Math.random()).slice(0, 4);
     res.json({
       poll: randomPoll,
       options: shuffledOptions,
@@ -780,7 +769,6 @@ app.put('/api/profile/:userId', async (req, res) => {
       updateData.coaching_hub = coaching_hub || coachingHub;
     }
     if (stream !== undefined) updateData.stream = stream;
-    updateData.city = 'Bathinda';
     updateData.district = 'Bathinda';
 
     let { data: updatedUser, error } = await supabase
@@ -1032,15 +1020,19 @@ app.post('/api/inbox/reveal', async (req, res) => {
 // --- IN-APP FRIEND SYSTEM ---
 app.get('/api/friends/search', async (req, res) => {
   try {
-    const { q, userId } = req.query;
+    const { q, userId, institute } = req.query;
     if (!q || !q.trim()) return res.json({ users: [] });
 
     const cleanQuery = q.trim().replace(/^@/, '');
     let query = supabase
       .from('users')
-      .select('id, handle, name, avatar, profile_pic, grade, ring, is_pro')
+      .select('id, handle, name, avatar, profile_pic, grade, ring, is_pro, institute')
       .ilike('handle', `%${cleanQuery}%`)
       .limit(25);
+
+    if (institute && institute.trim()) {
+      query = query.eq('institute', institute.trim());
+    }
 
     if (userId) {
       query = query.neq('id', userId);
@@ -1227,28 +1219,38 @@ app.get('/api/friends/accepted/:userId', async (req, res) => {
 
 app.get('/api/explore/leaderboard', async (req, res) => {
   try {
-    let result = await supabase
+    const targetInstitute = (req.query.institute || '').trim();
+    let query = supabase
       .from('users')
-      .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade, stream, institute, coaching_hub, invites, is_batch_captain')
+      .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade, stream, institute, coaching_hub, invites, is_batch_captain');
+
+    if (targetInstitute) {
+      query = query.eq('institute', targetInstitute);
+    }
+
+    let result = await query
       .order('total_votes', { ascending: false })
       .limit(100);
 
     if (result.error && (result.error.message?.includes('stream') || result.error.message?.includes('institute') || result.error.code === '42703')) {
-      result = await supabase
+      let retryQuery = supabase
         .from('users')
-        .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade, invites')
+        .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade, invites');
+      result = await retryQuery
         .order('total_votes', { ascending: false })
         .limit(100);
     }
 
-    const leaderboard = (result.data || []).map(u => ({
-      ...u,
-      institute: u.institute || 'Kapil Institute',
-      stream: u.stream || (u.grade === 12 ? '12th Board' : '11th Medical'),
-      grade: u.grade || 11,
-      coaching_hub: u.coaching_hub || 'Ajit Road Hub',
-      is_batch_captain: Boolean(u.is_batch_captain || ((u.invites || 0) >= 25))
-    }));
+    const leaderboard = (result.data || [])
+      .filter(u => !targetInstitute || u.institute === targetInstitute)
+      .map(u => ({
+        ...u,
+        institute: u.institute || targetInstitute || 'Kapil Institute',
+        stream: u.stream || (u.grade === 12 ? '12th Board' : '11th Medical'),
+        grade: u.grade || 11,
+        coaching_hub: u.coaching_hub || 'Ajit Road Hub',
+        is_batch_captain: Boolean(u.is_batch_captain || ((u.invites || 0) >= 25))
+      }));
 
     res.json({ success: true, leaderboard });
   } catch (err) {
@@ -1259,10 +1261,17 @@ app.get('/api/explore/leaderboard', async (req, res) => {
 // --- BATCH CAPTAINS (REFERRAL ENGINE) LEADERBOARD (Strict 25+ Recruits) ---
 app.get('/api/referrals/leaderboard', async (req, res) => {
   try {
-    let result = await supabase
+    const targetInstitute = (req.query.institute || '').trim();
+    let query = supabase
       .from('users')
-      .select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, city, district, invites, feed_drops, total_votes, is_pro, ring, is_batch_captain, batch_captain_admin_override')
-      .gte('invites', 25)
+      .select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, district, invites, feed_drops, total_votes, is_pro, ring, is_batch_captain, batch_captain_admin_override')
+      .gte('invites', 25);
+
+    if (targetInstitute) {
+      query = query.eq('institute', targetInstitute);
+    }
+
+    let result = await query
       .order('invites', { ascending: false })
       .limit(50);
 
@@ -1279,12 +1288,12 @@ app.get('/api/referrals/leaderboard', async (req, res) => {
     // Strict 25+ recruits filter - do NOT display users with 0, 1, or 3 recruits
     const rawList = result.data || [];
     const captains = rawList
+      .filter(u => !targetInstitute || u.institute === targetInstitute)
       .filter(u => ((u.invites || u.recruits || 0) >= 25 || u.batch_captain_admin_override))
       .map(u => ({
         ...u,
-        city: 'Bathinda',
         stream: u.stream || (u.grade === 12 ? '12th Board' : '11th Medical'),
-        institute: u.institute || 'Kapil Institute',
+        institute: u.institute || targetInstitute || 'Kapil Institute',
         coaching_hub: u.coaching_hub || 'Ajit Road Hub',
         feed_drops: u.feed_drops !== undefined && u.feed_drops !== null ? u.feed_drops : (u.invites || 0) * 50,
         is_batch_captain: true,
@@ -1299,10 +1308,17 @@ app.get('/api/referrals/leaderboard', async (req, res) => {
 
 app.get('/api/explore/legends', async (req, res) => {
   try {
-    let result = await supabase
+    const targetInstitute = (req.query.institute || '').trim();
+    let query = supabase
       .from('users')
       .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade, stream, institute, invites, is_batch_captain, batch_captain_admin_override')
-      .gte('invites', 25)
+      .gte('invites', 25);
+
+    if (targetInstitute) {
+      query = query.eq('institute', targetInstitute);
+    }
+
+    let result = await query
       .order('invites', { ascending: false })
       .limit(50);
 
@@ -1316,8 +1332,9 @@ app.get('/api/explore/legends', async (req, res) => {
     }
 
     let allUsers = result.data || [];
-    // Filter strictly for users who achieved 25+ recruits / Batch Captain status (no fake captains)
+    // Filter strictly for users from current institute who achieved 25+ recruits
     let legends = allUsers
+      .filter(u => !targetInstitute || u.institute === targetInstitute)
       .filter(u => ((u.invites || u.recruits || 0) >= 25 || u.batch_captain_admin_override))
       .map(u => ({
         ...u,
