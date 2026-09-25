@@ -257,15 +257,15 @@ app.post('/api/auth/google', async (req, res) => {
       .eq('email', email)
       .single();
 
-    // 2. If they don't exist, this is a new signup! Return isNewUser flag and basic info (no auto-insert)
-    if (!user) {
+    // 2. If they don't exist or profile data is incomplete, return isNewUser flag to trigger onboarding wizard
+    if (!user || !user.handle || !user.password || !user.institute) {
       return res.json({
         isNewUser: true,
         googleUser: {
           googleId,
           email,
-          name: name || '',
-          avatar: avatar || '',
+          name: user?.name || name || '',
+          avatar: user?.profile_pic || user?.avatar || avatar || '',
           refCode: cleanRef,
           referred_by: cleanRef
         }
@@ -821,8 +821,16 @@ app.put('/api/profile/:userId', async (req, res) => {
 app.delete('/api/profile/:userId', async (req, res) => {
   try {
     const { password } = req.body;
-    const { data: user } = await supabase.from('users').select('password').eq('id', req.params.userId).single();
-    if (!user || user.password !== password) return res.status(401).json({ error: 'Incorrect password' });
+    if (!password || !password.trim()) {
+      return res.status(400).json({ error: 'Password is required to confirm account deletion' });
+    }
+    const { data: user, error: fetchErr } = await supabase.from('users').select('password').eq('id', req.params.userId).single();
+    if (fetchErr || !user) {
+      return res.status(404).json({ error: 'User profile not found' });
+    }
+    if (user.password !== password.trim()) {
+      return res.status(401).json({ error: 'Incorrect password. Account deletion aborted.' });
+    }
     
     await supabase.from('users').delete().eq('id', req.params.userId);
     res.json({ success: true });
@@ -1248,12 +1256,13 @@ app.get('/api/explore/leaderboard', async (req, res) => {
   }
 });
 
-// --- BATCH CAPTAINS (REFERRAL ENGINE) LEADERBOARD ---
+// --- BATCH CAPTAINS (REFERRAL ENGINE) LEADERBOARD (Strict 25+ Recruits) ---
 app.get('/api/referrals/leaderboard', async (req, res) => {
   try {
     let result = await supabase
       .from('users')
       .select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, city, district, invites, feed_drops, total_votes, is_pro, ring, is_batch_captain, batch_captain_admin_override')
+      .gte('invites', 25)
       .order('invites', { ascending: false })
       .limit(50);
 
@@ -1262,21 +1271,25 @@ app.get('/api/referrals/leaderboard', async (req, res) => {
       result = await supabase
         .from('users')
         .select('id, handle, name, avatar, profile_pic, grade, district, invites, total_votes, is_pro, ring')
+        .gte('invites', 25)
         .order('invites', { ascending: false })
         .limit(50);
     }
 
-    if (result.error) throw result.error;
-    const captains = (result.data || []).map(u => ({
-      ...u,
-      city: 'Bathinda',
-      stream: u.stream || (u.grade === 12 ? '12th Board' : '11th Medical'),
-      institute: u.institute || 'Kapil Institute',
-      coaching_hub: u.coaching_hub || 'Ajit Road Hub',
-      feed_drops: u.feed_drops !== undefined && u.feed_drops !== null ? u.feed_drops : (u.invites || 0) * 50,
-      is_batch_captain: Boolean(u.is_batch_captain || u.batch_captain_admin_override || ((u.invites || 0) >= 25)),
-      batch_captain_admin_override: Boolean(u.batch_captain_admin_override)
-    }));
+    // Strict 25+ recruits filter - do NOT display users with 0, 1, or 3 recruits
+    const rawList = result.data || [];
+    const captains = rawList
+      .filter(u => ((u.invites || u.recruits || 0) >= 25 || u.batch_captain_admin_override))
+      .map(u => ({
+        ...u,
+        city: 'Bathinda',
+        stream: u.stream || (u.grade === 12 ? '12th Board' : '11th Medical'),
+        institute: u.institute || 'Kapil Institute',
+        coaching_hub: u.coaching_hub || 'Ajit Road Hub',
+        feed_drops: u.feed_drops !== undefined && u.feed_drops !== null ? u.feed_drops : (u.invites || 0) * 50,
+        is_batch_captain: true,
+        batch_captain_admin_override: Boolean(u.batch_captain_admin_override)
+      }));
     res.json({ success: true, leaderboard: captains });
   } catch (err) {
     console.error('Batch Captains Leaderboard Error:', err);
@@ -1289,6 +1302,7 @@ app.get('/api/explore/legends', async (req, res) => {
     let result = await supabase
       .from('users')
       .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade, stream, institute, invites, is_batch_captain, batch_captain_admin_override')
+      .gte('invites', 25)
       .order('invites', { ascending: false })
       .limit(50);
 
@@ -1296,29 +1310,19 @@ app.get('/api/explore/legends', async (req, res) => {
       result = await supabase
         .from('users')
         .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade, invites')
+        .gte('invites', 25)
         .order('invites', { ascending: false })
         .limit(50);
     }
 
     let allUsers = result.data || [];
-    // Filter strictly for users who achieved Batch Captain status (invites >= 25 or is_batch_captain)
+    // Filter strictly for users who achieved 25+ recruits / Batch Captain status (no fake captains)
     let legends = allUsers
-      .filter(u => Boolean(u.is_batch_captain || u.batch_captain_admin_override || (u.invites || 0) >= 25))
+      .filter(u => ((u.invites || u.recruits || 0) >= 25 || u.batch_captain_admin_override))
       .map(u => ({
         ...u,
         is_batch_captain: true
       }));
-
-    // If no batch captains yet, include active Pro / top users marked clearly
-    if (legends.length === 0) {
-      legends = allUsers
-        .filter(u => u.is_pro || (u.invites || 0) > 0)
-        .slice(0, 10)
-        .map(u => ({
-          ...u,
-          is_batch_captain: Boolean(u.is_batch_captain || (u.invites || 0) >= 25)
-        }));
-    }
 
     res.json({ success: true, legends });
   } catch (err) {
