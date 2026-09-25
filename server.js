@@ -1219,10 +1219,32 @@ app.get('/api/friends/accepted/:userId', async (req, res) => {
 
 app.get('/api/explore/leaderboard', async (req, res) => {
   try {
-    const { data: leaderboard } = await supabase.from('users').select('id, handle, avatar, profile_pic, total_votes, is_pro').order('total_votes', { ascending: false }).limit(30);
-    res.json({ leaderboard: leaderboard || [] });
+    let result = await supabase
+      .from('users')
+      .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade, stream, institute, coaching_hub, invites, is_batch_captain')
+      .order('total_votes', { ascending: false })
+      .limit(100);
+
+    if (result.error && (result.error.message?.includes('stream') || result.error.message?.includes('institute') || result.error.code === '42703')) {
+      result = await supabase
+        .from('users')
+        .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade, invites')
+        .order('total_votes', { ascending: false })
+        .limit(100);
+    }
+
+    const leaderboard = (result.data || []).map(u => ({
+      ...u,
+      institute: u.institute || 'Kapil Institute',
+      stream: u.stream || (u.grade === 12 ? '12th Board' : '11th Medical'),
+      grade: u.grade || 11,
+      coaching_hub: u.coaching_hub || 'Ajit Road Hub',
+      is_batch_captain: Boolean(u.is_batch_captain || ((u.invites || 0) >= 25))
+    }));
+
+    res.json({ success: true, leaderboard });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message, leaderboard: [] });
   }
 });
 
@@ -1264,15 +1286,41 @@ app.get('/api/referrals/leaderboard', async (req, res) => {
 
 app.get('/api/explore/legends', async (req, res) => {
   try {
-    const { data: legends, error } = await supabase
+    let result = await supabase
       .from('users')
-      .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade')
-      .eq('is_pro', true)
-      .order('total_votes', { ascending: false })
-      .limit(30);
+      .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade, stream, institute, invites, is_batch_captain, batch_captain_admin_override')
+      .order('invites', { ascending: false })
+      .limit(50);
 
-    if (error) throw error;
-    res.json({ legends: legends || [] });
+    if (result.error && (result.error.message?.includes('stream') || result.error.message?.includes('institute') || result.error.code === '42703')) {
+      result = await supabase
+        .from('users')
+        .select('id, handle, name, avatar, profile_pic, ring, selected_ring, total_votes, is_pro, grade, invites')
+        .order('invites', { ascending: false })
+        .limit(50);
+    }
+
+    let allUsers = result.data || [];
+    // Filter strictly for users who achieved Batch Captain status (invites >= 25 or is_batch_captain)
+    let legends = allUsers
+      .filter(u => Boolean(u.is_batch_captain || u.batch_captain_admin_override || (u.invites || 0) >= 25))
+      .map(u => ({
+        ...u,
+        is_batch_captain: true
+      }));
+
+    // If no batch captains yet, include active Pro / top users marked clearly
+    if (legends.length === 0) {
+      legends = allUsers
+        .filter(u => u.is_pro || (u.invites || 0) > 0)
+        .slice(0, 10)
+        .map(u => ({
+          ...u,
+          is_batch_captain: Boolean(u.is_batch_captain || (u.invites || 0) >= 25)
+        }));
+    }
+
+    res.json({ success: true, legends });
   } catch (err) {
     console.error('Legends fetch error:', err);
     res.status(500).json({ error: err.message, legends: [] });
