@@ -19,6 +19,169 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
+// --- SESSION COOLDOWNS & VOTE COUNTER (IN-MEMORY & DB RESILIENT TRACKER) ---
+const sessionCooldowns = new Map();
+
+const getUserCooldownState = async (userId, userFromDb) => {
+  let state = sessionCooldowns.get(userId);
+  if (!state) {
+    state = {
+      session_vote_count: userFromDb?.session_vote_count || 0,
+      cooldown_until: userFromDb?.cooldown_until || userFromDb?.cooldown_expires_at || null
+    };
+    sessionCooldowns.set(userId, state);
+  } else if ((userFromDb?.cooldown_until || userFromDb?.cooldown_expires_at) && !state.cooldown_until) {
+    state.cooldown_until = userFromDb.cooldown_until || userFromDb.cooldown_expires_at;
+  }
+  // Check if cooldown has expired
+  if (state.cooldown_until && new Date(state.cooldown_until).getTime() <= Date.now()) {
+    state.cooldown_until = null;
+    state.session_vote_count = 0;
+  }
+  return state;
+};
+
+/**
+ * Task 3: Backend Cooldown Reset Logic
+ * When User B joins / authenticates with referred_by = 'User_A_Code',
+ * automatically reset User A's cooldown_until / cooldown_expires_at timestamp
+ * and session_vote_count to 0 to allow immediate voting without delay.
+ */
+const unlockReferrerCooldown = async (cleanRef, newUserId = null, newUserHandle = null) => {
+  if (!cleanRef) return null;
+  const ref = cleanRef.trim().replace(/^@/, '');
+  if (!ref) return null;
+
+  try {
+    let referrer = null;
+
+    // 1. Search referrer by invite_code
+    const { data: byCode } = await supabase
+      .from('users')
+      .select('id, handle, invite_code, my_invite_code, session_vote_count, cooldown_until, cooldown_expires_at, invites, feed_drops')
+      .ilike('invite_code', ref)
+      .maybeSingle();
+
+    if (byCode) {
+      referrer = byCode;
+    } else {
+      // 2. Search referrer by handle
+      const { data: byHandle } = await supabase
+        .from('users')
+        .select('id, handle, invite_code, my_invite_code, session_vote_count, cooldown_until, cooldown_expires_at, invites, feed_drops')
+        .ilike('handle', ref)
+        .maybeSingle();
+
+      if (byHandle) {
+        referrer = byHandle;
+      } else {
+        // 3. Search referrer by my_invite_code
+        const { data: byMyCode } = await supabase
+          .from('users')
+          .select('id, handle, invite_code, my_invite_code, session_vote_count, cooldown_until, cooldown_expires_at, invites, feed_drops')
+          .ilike('my_invite_code', ref)
+          .maybeSingle();
+        if (byMyCode) referrer = byMyCode;
+      }
+    }
+
+    if (!referrer) {
+      console.log(`[Referral Loop] Referrer not found for invite code: "${ref}"`);
+      return null;
+    }
+
+    // Ignore self-referrals
+    if (newUserId && referrer.id === newUserId) {
+      console.log(`[Referral Loop] Self-referral ignored for ${newUserId}`);
+      return null;
+    }
+
+    console.log(`⚡ [Referral Loop Verified] Unlocking cooldown for Referrer @${referrer.handle || referrer.id} because friend @${newUserHandle || newUserId || 'joined'} used code "${ref}"!`);
+
+    // Reset in-memory session cooldown
+    sessionCooldowns.set(referrer.id, {
+      session_vote_count: 0,
+      cooldown_until: null
+    });
+
+    // Reset database cooldown & award referral bonus (+1 invite, +50 drops)
+    const updatedInvites = (referrer.invites || 0) + 1;
+    const isBatchCaptain = updatedInvites >= 25;
+
+    const updatePayload = {
+      cooldown_until: null,
+      session_vote_count: 0,
+      invites: updatedInvites,
+      is_batch_captain: isBatchCaptain
+    };
+
+    try {
+      await supabase
+        .from('users')
+        .update({
+          ...updatePayload,
+          cooldown_expires_at: null,
+          feed_drops: (referrer.feed_drops || 0) + 50
+        })
+        .eq('id', referrer.id);
+    } catch (_) {
+      try {
+        await supabase
+          .from('users')
+          .update(updatePayload)
+          .eq('id', referrer.id);
+      } catch (dbErr) {
+        console.error('Error updating referrer in Supabase:', dbErr);
+      }
+    }
+
+    // Send inbox notification to Referrer
+    try {
+      await supabase.from('inbox').insert([{
+        user_id: referrer.id,
+        recipient_id: referrer.id,
+        sender_id: newUserId || null,
+        sender_name: newUserHandle ? `@${newUserHandle}` : 'A friend',
+        text: `⚡ A friend joined using your link! Cooldown cleared & voting instantly unlocked!`,
+        created_at: new Date().toISOString()
+      }]);
+    } catch (_) {}
+
+    return referrer;
+  } catch (err) {
+    console.error('Failed to unlock referrer cooldown:', err);
+    return null;
+  }
+};
+
+// --- REAL-TIME USER COOLDOWN CHECK ENDPOINT (Task 4) ---
+app.get('/api/user/cooldown/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, session_vote_count, cooldown_until, cooldown_expires_at, is_pro')
+      .eq('id', userId)
+      .maybeSingle();
+
+    const state = await getUserCooldownState(userId, user);
+    const activeCd = (!user?.is_pro && (state.cooldown_until || user?.cooldown_expires_at)) || null;
+    const isCooldownActive = Boolean(activeCd && new Date(activeCd).getTime() > Date.now());
+
+    res.json({
+      userId,
+      cooldown_until: isCooldownActive ? activeCd : null,
+      session_vote_count: isCooldownActive ? state.session_vote_count : 0,
+      is_cooldown_active: isCooldownActive,
+      is_pro: Boolean(user?.is_pro)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- AUTHENTICATION ---
 app.post('/api/auth', async (req, res) => {
   try {
@@ -38,6 +201,7 @@ app.post('/api/auth', async (req, res) => {
         avatar,
         invite_code: inviteCode,
         invite_code_used: cleanRef,
+        referred_by: cleanRef,
         invites: 0,
         feed_drops: 0,
         referral_rewarded: false,
@@ -52,14 +216,19 @@ app.post('/api/auth', async (req, res) => {
         bio: `${finalInstitute} • ${finalStream}`
       };
       let { data: createdUser, error: insertErr } = await supabase.from('users').insert([newUser]).select().single();
-      if (insertErr && (insertErr.message?.includes('institute') || insertErr.message?.includes('coaching_hub') || insertErr.message?.includes('stream'))) {
+      if (insertErr && (insertErr.message?.includes('institute') || insertErr.message?.includes('coaching_hub') || insertErr.message?.includes('stream') || insertErr.message?.includes('referred_by'))) {
         delete newUser.institute;
         delete newUser.coaching_hub;
         delete newUser.stream;
+        delete newUser.referred_by;
         const retry = await supabase.from('users').insert([newUser]).select().single();
         createdUser = retry.data;
       }
       user = createdUser;
+
+      if (cleanRef && user?.id) {
+        await unlockReferrerCooldown(cleanRef, user.id, user.handle);
+      }
     } else if (user.password !== password) {
       return res.status(401).json({ error: 'Incorrect password' });
     }
@@ -77,7 +246,8 @@ app.post('/api/auth', async (req, res) => {
 
 // --- GOOGLE AUTH SYNC ROUTE ---
 app.post('/api/auth/google', async (req, res) => {
-  const { googleId, email, name, avatar, grade } = req.body;
+  const { googleId, email, name, avatar, grade, refCode, referred_by } = req.body;
+  const cleanRef = (refCode || referred_by || '').trim().replace(/^@/, '');
 
   try {
     // 1. Check if this student already exists in your Supabase 'users' table
@@ -95,9 +265,22 @@ app.post('/api/auth/google', async (req, res) => {
           googleId,
           email,
           name: name || '',
-          avatar: avatar || ''
+          avatar: avatar || '',
+          refCode: cleanRef,
+          referred_by: cleanRef
         }
       });
+    }
+
+    // If user exists and hadn't used a referral code before, register the referral now and unlock User A
+    if (cleanRef && user && !user.invite_code_used && !user.referred_by) {
+      try {
+        await supabase.from('users').update({
+          invite_code_used: cleanRef,
+          referred_by: cleanRef
+        }).eq('id', user.id);
+        await unlockReferrerCooldown(cleanRef, user.id, user.handle);
+      } catch (_) {}
     }
 
     // 3. If user exists, send their profile back to unlock UI with coaching taxonomy
@@ -154,7 +337,7 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
 
     // Generate user invite code & record referrer
     const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const cleanRef = refCode ? refCode.trim().replace(/^@/, '') : null;
+    const cleanRef = (refCode || req.body.referred_by || '').trim().replace(/^@/, '');
 
     // Default avatar based on gender
     const defaultAvatar = avatar || (gender === 'girl' ? '🌸' : gender === 'boy' ? '😎' : '✨');
@@ -190,6 +373,7 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
         avatar: defaultAvatar,
         my_invite_code: finalHandle,
         invite_code_used: existingUser.invite_code_used || cleanRef,
+        referred_by: existingUser.referred_by || cleanRef,
         bio: existingUser.bio || `${finalInstitute} • ${finalStream}`
       };
 
@@ -200,10 +384,11 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
         .select()
         .single();
 
-      if (updateError && (updateError.message?.includes('institute') || updateError.message?.includes('coaching_hub') || updateError.message?.includes('stream'))) {
+      if (updateError && (updateError.message?.includes('institute') || updateError.message?.includes('coaching_hub') || updateError.message?.includes('stream') || updateError.message?.includes('referred_by'))) {
         delete updatePayload.institute;
         delete updatePayload.coaching_hub;
         delete updatePayload.stream;
+        delete updatePayload.referred_by;
         const retry = await supabase
           .from('users')
           .update(updatePayload)
@@ -239,6 +424,7 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
         invite_code: inviteCode,
         my_invite_code: finalHandle,
         invite_code_used: cleanRef,
+        referred_by: cleanRef,
         invites: 0,
         feed_drops: 0,
         referral_rewarded: false,
@@ -254,13 +440,14 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
         .select()
         .single();
 
-      if (insertError && (insertError.message?.includes('feed_drops') || insertError.message?.includes('city') || insertError.message?.includes('institute') || insertError.message?.includes('coaching_hub') || insertError.message?.includes('stream'))) {
+      if (insertError && (insertError.message?.includes('feed_drops') || insertError.message?.includes('city') || insertError.message?.includes('institute') || insertError.message?.includes('coaching_hub') || insertError.message?.includes('stream') || insertError.message?.includes('referred_by'))) {
         delete newUser.feed_drops;
         delete newUser.referral_rewarded;
         delete newUser.city;
         delete newUser.institute;
         delete newUser.coaching_hub;
         delete newUser.stream;
+        delete newUser.referred_by;
         const retry = await supabase
           .from('users')
           .insert([newUser])
@@ -282,6 +469,11 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
       userResult.institute = userResult.institute || finalInstitute;
       userResult.coaching_hub = userResult.coaching_hub || finalHub;
       userResult.stream = userResult.stream || finalStream;
+
+      // Task 3: Automatically unlock Referrer's cooldown timestamp & reset session votes
+      if (cleanRef) {
+        await unlockReferrerCooldown(cleanRef, userResult.id, userResult.handle);
+      }
     }
 
     res.json({ user: userResult });
@@ -336,28 +528,6 @@ app.get('/api/classmates/suggested', async (req, res) => {
     res.status(500).json({ error: err.message, classmates: BATHINDA_COACHING_FALLBACK_PEERS });
   }
 });
-
-// --- SESSION COOLDOWNS & VOTE COUNTER (IN-MEMORY & DB RESILIENT TRACKER) ---
-const sessionCooldowns = new Map();
-
-const getUserCooldownState = async (userId, userFromDb) => {
-  let state = sessionCooldowns.get(userId);
-  if (!state) {
-    state = {
-      session_vote_count: userFromDb?.session_vote_count || 0,
-      cooldown_until: userFromDb?.cooldown_until || null
-    };
-    sessionCooldowns.set(userId, state);
-  } else if (userFromDb?.cooldown_until && !state.cooldown_until) {
-    state.cooldown_until = userFromDb.cooldown_until;
-  }
-  // Check if cooldown has expired
-  if (state.cooldown_until && new Date(state.cooldown_until).getTime() <= Date.now()) {
-    state.cooldown_until = null;
-    state.session_vote_count = 0;
-  }
-  return state;
-};
 
 // --- PLAY & VOTING ---
 const TUITION_POLLS_FALLBACK = [
@@ -525,17 +695,27 @@ app.post('/api/vote', async (req, res) => {
   }
 });
 
-// Clear Cooldown (Viral Loop Skip or God Mode activation)
+// Clear Cooldown (God Mode VIP activation or verified timer expiry)
 app.post('/api/cooldown/skip', async (req, res) => {
   try {
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId is required' });
 
+    // Validate that user is Pro OR cooldown is already expired/cleared in DB
+    const { data: user } = await supabase.from('users').select('id, is_pro, cooldown_until, cooldown_expires_at').eq('id', userId).maybeSingle();
+    const activeCd = user?.cooldown_until || user?.cooldown_expires_at;
+    const isExpired = !activeCd || new Date(activeCd).getTime() <= Date.now();
+
+    if (!user?.is_pro && !isExpired) {
+      return res.status(403).json({ error: 'Cooldown active. Timer unlocks when a friend authenticates with your invite code!' });
+    }
+
     sessionCooldowns.set(userId, { session_vote_count: 0, cooldown_until: null });
     try {
       await supabase.from('users').update({
         session_vote_count: 0,
-        cooldown_until: null
+        cooldown_until: null,
+        cooldown_expires_at: null
       }).eq('id', userId);
     } catch (_) {}
 
