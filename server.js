@@ -322,7 +322,18 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
     const finalHub = coaching_hub || coachingHub || 'Ajit Road Hub';
     const finalStream = stream || '11th Medical';
 
-    // Check if handle is already taken
+    // 1. First, find if the user already exists (by email or googleId)
+    let existingUser = null;
+    if (email) {
+      const { data: byEmail } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
+      existingUser = byEmail;
+    }
+    if (!existingUser && googleId) {
+      const { data: byGid } = await supabase.from('users').select('*').eq('google_id', googleId).maybeSingle();
+      existingUser = byGid;
+    }
+
+    // 2. Then, check if the handle is taken by SOMEONE ELSE
     const { data: existingHandle } = await supabase
       .from('users')
       .select('id')
@@ -330,7 +341,8 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
       .maybeSingle();
 
     let finalHandle = cleanHandle;
-    if (existingHandle) {
+    // ONLY append numbers if the handle is taken AND the ID doesn't match the current user
+    if (existingHandle && (!existingUser || existingHandle.id !== existingUser.id)) {
       finalHandle = `${cleanHandle}${Math.floor(100 + Math.random() * 900)}`;
     }
 
@@ -341,17 +353,6 @@ app.post('/api/user/complete-onboarding', async (req, res) => {
     // Default avatar based on gender
     const defaultAvatar = avatar || (gender === 'girl' ? '🌸' : gender === 'boy' ? '😎' : '✨');
     const safeEmail = email || `${finalHandle.toLowerCase()}@bathinda.centerinsider.local`;
-
-    // Check if user already exists by email or googleId to support update/re-onboarding safely
-    let existingUser = null;
-    if (email) {
-      const { data: byEmail } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
-      existingUser = byEmail;
-    }
-    if (!existingUser && googleId) {
-      const { data: byGid } = await supabase.from('users').select('*').eq('google_id', googleId).maybeSingle();
-      existingUser = byGid;
-    }
 
     let userResult = null;
 
