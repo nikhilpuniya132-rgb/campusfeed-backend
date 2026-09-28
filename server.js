@@ -13,7 +13,10 @@ app.options('*', cors());
 app.use(express.json({ limit: '5mb' }));
 
 // Initialize Database & Payment Gateway
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY
+);
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
@@ -236,6 +239,7 @@ app.post('/api/auth', async (req, res) => {
       user.institute = user.institute || 'Kapil Institute';
       user.coaching_hub = user.coaching_hub || 'Ajit Road Hub';
       user.stream = user.stream || '11th Medical';
+      delete user.password;
     }
     res.json({ user });
   } catch (err) {
@@ -895,26 +899,35 @@ app.get('/api/inbox/:userId', async (req, res) => {
       inviteCount = (invitedUsers || []).length;
     }
     const effectiveInvites = Math.max(inviteCount, user?.invites || 0);
-    const canReveal = Boolean(user?.is_pro) || effectiveInvites >= 3;
+    // God Mode status verified strictly from database:
+    const isGodMode = Boolean(user?.is_pro);
+    // Bulk inbox reveal is strictly reserved for verified God Mode subscribers.
+    const canReveal = isGodMode;
 
     const messages = (votes || []).map(v => {
       const voterGender = v.users?.gender || 'boy';
 
       if (!canReveal) {
-        // STRICT SECURITY GATING: Mask voter identity completely!
-        // Return ONLY question, voterGender, and voteId
+        // STRICT PRIVACY ENFORCEMENT:
+        // Strip out voter_id, voter_name, voterHandle, voterPic, and voterAvatar.
+        // Standard frontend users receive ONLY non-identifying metadata:
         return {
           voteId: v.id,
           question: v.polls?.question || 'Secret Compliment',
           voterGender,
+          createdAt: v.created_at,
+          totalVotes: user?.total_votes || 0,
           isLocked: true
         };
       } else {
-        // UNLOCKED: Return complete voter profile
+        // VERIFIED GOD MODE SUBSCRIBER:
+        // Deliver revealed classmate profile, strictly omitting internal database voter_id
         return {
           voteId: v.id,
           question: v.polls?.question || 'Secret Compliment',
           voterGender,
+          createdAt: v.created_at,
+          totalVotes: user?.total_votes || 0,
           voterHandle: v.users?.handle,
           voterName: v.users?.name || v.users?.handle,
           voterAvatar: v.users?.avatar || '😎',
@@ -926,7 +939,13 @@ app.get('/api/inbox/:userId', async (req, res) => {
       }
     });
 
-    res.json({ canReveal, effectiveInvites, remaining: Math.max(0, 3 - effectiveInvites), messages });
+    res.json({
+      canReveal: isGodMode,
+      isGodMode,
+      effectiveInvites,
+      remaining: Math.max(0, 3 - effectiveInvites),
+      messages
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -965,22 +984,13 @@ const handleRevealRequest = async (voteId, userId, res) => {
       count = (invitedUsers || []).length;
     }
     const effectiveInvites = Math.max(count, user.invites || 0);
-
-    // If count < 3 and user is not Pro, return HTTP 403 with { locked: true, remaining: 3 - count }
-    if (!user.is_pro && effectiveInvites < 3) {
-      const remaining = Math.max(0, 3 - effectiveInvites);
-      return res.status(403).json({
-        locked: true,
-        remaining,
-        count: effectiveInvites,
-        error: 'Invite requirement not met'
-      });
-    }
+    const isGodMode = Boolean(user.is_pro);
+    const hasAccess = isGodMode || effectiveInvites >= 3;
 
     // Fetch the vote with voter and poll details
     const { data: vote, error: voteError } = await supabase
       .from('votes')
-      .select(`id, poll_id, voter_id, users!voter_id(id, handle, name, avatar, profile_pic, ring, is_pro, gender), polls(question)`)
+      .select(`id, poll_id, voter_id, receiver_id, created_at, users!voter_id(id, handle, name, avatar, profile_pic, ring, is_pro, gender), polls(question)`)
       .eq('id', voteId)
       .single();
 
@@ -988,6 +998,32 @@ const handleRevealRequest = async (voteId, userId, res) => {
       return res.status(404).json({ error: 'Vote not found' });
     }
 
+    // STRICT RECIPIENT VERIFICATION:
+    // A user can ONLY inspect and reveal votes directed to their own receiver_id!
+    if (String(vote.receiver_id) !== String(userId)) {
+      return res.status(403).json({
+        locked: true,
+        revealed: false,
+        error: 'Unauthorized: You are not the recipient of this vote'
+      });
+    }
+
+    // If neither God Mode nor 3 verified invites, reject with 403 and strip all identifying details!
+    if (!hasAccess) {
+      const remaining = Math.max(0, 3 - effectiveInvites);
+      return res.status(403).json({
+        locked: true,
+        revealed: false,
+        remaining,
+        count: effectiveInvites,
+        voterGender: vote.users?.gender || 'boy',
+        createdAt: vote.created_at,
+        question: vote.polls?.question,
+        error: 'Invite requirement or God Mode subscription not met'
+      });
+    }
+
+    // Unlocked: Return display details ONLY, strictly excluding raw voter_id
     res.json({
       success: true,
       locked: false,
@@ -997,6 +1033,7 @@ const handleRevealRequest = async (voteId, userId, res) => {
       voterAvatar: vote.users?.avatar || '😎',
       voterPic: vote.users?.profile_pic || '',
       voterGender: vote.users?.gender || 'boy',
+      createdAt: vote.created_at,
       isPro: Boolean(vote.users?.is_pro),
       ring: vote.users?.ring || 'none',
       question: vote.polls?.question
