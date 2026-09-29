@@ -677,7 +677,7 @@ app.get('/api/play/:userId', async (req, res) => {
 
     const activeFilter = streamFilter || gradeFilter;
     if (activeFilter && activeFilter !== 'all' && activeFilter !== 'All Bathinda') {
-      if (activeFilter.includes('Med') || activeFilter.includes('Board') || activeFilter.includes('Dropper') || activeFilter.includes('Commerce')) {
+      if (activeFilter.includes('Class') || activeFilter.includes('Med') || activeFilter.includes('JEE') || activeFilter.includes('NEET') || activeFilter.includes('Arts') || activeFilter.includes('Commerce') || activeFilter.includes('Board') || activeFilter.includes('Dropper')) {
         query = query.ilike('stream', `%${activeFilter}%`);
       } else {
         query = query.or(`grade.eq.${activeFilter},grade.eq.${parseInt(activeFilter) || activeFilter}`);
