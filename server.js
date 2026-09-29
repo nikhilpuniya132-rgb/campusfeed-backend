@@ -868,6 +868,39 @@ app.post('/api/user/ring', async (req, res) => {
 });
 
 // --- PROFILE MANAGEMENT ---
+app.get('/api/profile/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId || userId === 'undefined' || userId === 'null') {
+      return res.status(200).json({ exists: false, user: null, message: 'Profile not found' });
+    }
+
+    let { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (!user) {
+      const { data: userByGid } = await supabase
+        .from('users')
+        .select('*')
+        .eq('google_id', userId)
+        .maybeSingle();
+      if (userByGid) user = userByGid;
+    }
+
+    if (error || !user) {
+      return res.status(200).json({ exists: false, user: null, message: 'Profile not found' });
+    }
+
+    return res.status(200).json({ exists: true, user });
+  } catch (err) {
+    console.error('GET /api/profile/:userId error:', err);
+    return res.status(200).json({ exists: false, user: null, message: 'Profile not found', error: err.message });
+  }
+});
+
 app.put('/api/profile/:userId', async (req, res) => {
   try {
     const { bio, avatar, ring, profile_pic, grade, city, institute, coaching_hub, coachingHub, stream } = req.body;
@@ -945,10 +978,18 @@ app.delete('/api/profile/:userId', async (req, res) => {
 
 app.get('/api/profile/public/:userId', async (req, res) => {
   try {
-    const { data: user } = await supabase.from('users').select('id, handle, bio, avatar, profile_pic, total_votes, is_pro').eq('id', req.params.userId).single();
-    res.json({ user });
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('id, handle, bio, avatar, profile_pic, total_votes, is_pro')
+      .eq('id', req.params.userId)
+      .maybeSingle();
+
+    if (error || !user) {
+      return res.status(200).json({ exists: false, user: null, message: 'Public profile not found' });
+    }
+    res.json({ exists: true, user });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(200).json({ exists: false, user: null, error: err.message });
   }
 });
 
@@ -1850,6 +1891,11 @@ app.post('/api/submit-poll', async (req, res) => {
     console.error('Submit custom poll error:', err);
     res.status(500).json({ error: 'Server error while submitting custom poll: ' + err.message });
   }
+});
+
+// Catch-all for undefined /api routes to prevent HTML 404 error pages
+app.all('/api/*', (req, res) => {
+  res.status(200).json({ exists: false, error: 'Endpoint not found', message: 'API route not found' });
 });
 
 const PORT = process.env.PORT || 5000;
