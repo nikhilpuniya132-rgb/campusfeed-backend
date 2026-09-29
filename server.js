@@ -50,6 +50,112 @@ const getUserCooldownState = async (userId, userFromDb) => {
  * automatically reset User A's cooldown_until / cooldown_expires_at timestamp
  * and session_vote_count to 0 to allow immediate voting without delay.
  */
+
+/**
+ * 3. The "God Mode" Auto-Upgrade (25 Invites)
+ * Queries the database and counts the total number of user profiles that share this specific referred_by ID.
+ * If the count reaches 25 or more, automatically updates the referring user's profile to set is_god_mode = true.
+ */
+const checkAndAutoUpgradeGodMode = async (cleanRef, newUserId = null) => {
+  if (!cleanRef) return null;
+  const ref = cleanRef.trim().replace(/^@/, '');
+  if (!ref) return null;
+
+  try {
+    // 1. Locate referrer by id, handle, or invite_code
+    let referrer = null;
+    const { data: byId } = await supabase
+      .from('users')
+      .select('id, handle, is_god_mode, is_pro, invites')
+      .eq('id', ref)
+      .maybeSingle();
+
+    if (byId) {
+      referrer = byId;
+    } else {
+      const { data: byCode } = await supabase
+        .from('users')
+        .select('id, handle, is_god_mode, is_pro, invites')
+        .or(`invite_code.ilike.${ref},handle.ilike.${ref},my_invite_code.ilike.${ref}`)
+        .maybeSingle();
+      if (byCode) referrer = byCode;
+    }
+
+    const referrerId = referrer?.id || ref;
+
+    // 2. Query the database and count the total number of user profiles that share this specific referred_by ID
+    const { count } = await supabase
+      .from('users')
+      .select('id', { count: 'exact', head: true })
+      .or(`referred_by.eq.${referrerId},referred_by.ilike.${ref}`);
+
+    let totalCount = count || 0;
+
+    // Check profiles table if separate table exists
+    try {
+      const { count: pCount } = await supabase
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('referred_by', referrerId);
+      if (pCount) totalCount = Math.max(totalCount, pCount);
+    } catch (_) {}
+
+    // Check SQLite db
+    try {
+      const row = db.prepare('SELECT COUNT(*) as c FROM users WHERE referred_by = ? OR referred_by = ?').get(referrerId, ref);
+      if (row?.c) totalCount = Math.max(totalCount, row.c);
+    } catch (_) {}
+
+    console.log(`[God Mode Auto-Upgrade Check] Referrer "${referrerId}" has ${totalCount} referred profiles.`);
+
+    // 3. If count reaches 25 or more, automatically update referring user's profile to set is_god_mode = true
+    if (totalCount >= 25) {
+      console.log(`👑 [God Mode Auto-Upgrade] User "${referrerId}" reached ${totalCount} invites! Setting is_god_mode = true.`);
+      
+      await supabase
+        .from('users')
+        .update({
+          is_god_mode: true,
+          is_pro: true,
+          is_batch_captain: true
+        })
+        .or(`id.eq.${referrerId},handle.ilike.${ref}`);
+
+      try {
+        await supabase
+          .from('profiles')
+          .update({
+            is_god_mode: true,
+            is_pro: true
+          })
+          .eq('id', referrerId);
+      } catch (_) {}
+
+      try {
+        db.prepare('UPDATE users SET is_god_mode = 1 WHERE id = ? OR handle = ?').run(referrerId, ref);
+      } catch (_) {}
+
+      try {
+        await supabase.from('inbox').insert([{
+          user_id: referrerId,
+          recipient_id: referrerId,
+          sender_id: newUserId || null,
+          sender_name: 'CenterInsider VIP',
+          text: '👑 GOD MODE UNLOCKED: You invited 25+ friends! You now have permanent God Mode and AI Custom Poll creation privileges!',
+          created_at: new Date().toISOString()
+        }]);
+      } catch (_) {}
+
+      return { is_god_mode: true, totalCount };
+    }
+
+    return { is_god_mode: false, totalCount };
+  } catch (err) {
+    console.error('Error during God Mode auto-upgrade check:', err);
+    return null;
+  }
+};
+
 const unlockReferrerCooldown = async (cleanRef, newUserId = null, newUserHandle = null) => {
   if (!cleanRef) return null;
   const ref = cleanRef.trim().replace(/^@/, '');
@@ -61,7 +167,7 @@ const unlockReferrerCooldown = async (cleanRef, newUserId = null, newUserHandle 
     // 1. Search referrer by invite_code
     const { data: byCode } = await supabase
       .from('users')
-      .select('id, handle, invite_code, my_invite_code, session_vote_count, cooldown_until, cooldown_expires_at, invites, feed_drops')
+      .select('id, handle, invite_code, my_invite_code, session_vote_count, cooldown_until, cooldown_expires_at, invites, feed_drops, is_god_mode')
       .ilike('invite_code', ref)
       .maybeSingle();
 
@@ -71,7 +177,7 @@ const unlockReferrerCooldown = async (cleanRef, newUserId = null, newUserHandle 
       // 2. Search referrer by handle
       const { data: byHandle } = await supabase
         .from('users')
-        .select('id, handle, invite_code, my_invite_code, session_vote_count, cooldown_until, cooldown_expires_at, invites, feed_drops')
+        .select('id, handle, invite_code, my_invite_code, session_vote_count, cooldown_until, cooldown_expires_at, invites, feed_drops, is_god_mode')
         .ilike('handle', ref)
         .maybeSingle();
 
@@ -81,7 +187,7 @@ const unlockReferrerCooldown = async (cleanRef, newUserId = null, newUserHandle 
         // 3. Search referrer by my_invite_code
         const { data: byMyCode } = await supabase
           .from('users')
-          .select('id, handle, invite_code, my_invite_code, session_vote_count, cooldown_until, cooldown_expires_at, invites, feed_drops')
+          .select('id, handle, invite_code, my_invite_code, session_vote_count, cooldown_until, cooldown_expires_at, invites, feed_drops, is_god_mode')
           .ilike('my_invite_code', ref)
           .maybeSingle();
         if (byMyCode) referrer = byMyCode;
@@ -110,12 +216,14 @@ const unlockReferrerCooldown = async (cleanRef, newUserId = null, newUserHandle 
     // Reset database cooldown & award referral bonus (+1 invite, +50 drops)
     const updatedInvites = (referrer.invites || 0) + 1;
     const isBatchCaptain = updatedInvites >= 25;
+    const isGodMode = referrer.is_god_mode || isBatchCaptain;
 
     const updatePayload = {
       cooldown_until: null,
       session_vote_count: 0,
       invites: updatedInvites,
-      is_batch_captain: isBatchCaptain
+      is_batch_captain: isBatchCaptain,
+      is_god_mode: isGodMode
     };
 
     try {
@@ -137,6 +245,9 @@ const unlockReferrerCooldown = async (cleanRef, newUserId = null, newUserHandle 
         console.error('Error updating referrer in Supabase:', dbErr);
       }
     }
+
+    // Check count of user profiles sharing this referred_by to auto-upgrade to God Mode
+    await checkAndAutoUpgradeGodMode(ref, newUserId);
 
     // Send inbox notification to Referrer
     try {
@@ -1463,6 +1574,281 @@ app.get('/api/explore/trending', async (req, res) => {
   } catch (err) {
     console.error('Trending fetch error:', err);
     res.status(500).json({ error: err.message, trending: [] });
+  }
+});
+
+// ============================================================================
+// 4. GOD MODE CUSTOM POLLS & AI SAFETY FILTER
+// ============================================================================
+
+/**
+ * Exact System Prompt required by specification:
+ * "You are a strict school moderator. Analyze this poll question. If it contains profanity, sexual content, bullying, names a specific student in a negative way, or is mean-spirited, return REJECTED. If it is positive, fun, and safe, return APPROVED."
+ */
+const MODERATOR_SYSTEM_PROMPT = "You are a strict school moderator. Analyze this poll question. If it contains profanity, sexual content, bullying, names a specific student in a negative way, or is mean-spirited, return REJECTED. If it is positive, fun, and safe, return APPROVED.";
+
+const moderatePollQuestion = async (question) => {
+  const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
+  const openAiKey = process.env.OPENAI_API_KEY;
+
+  if (geminiKey) {
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: `${MODERATOR_SYSTEM_PROMPT}\n\nPoll question to analyze:\n"${question}"\n\nReturn strictly either APPROVED or REJECTED.` }]
+            }
+          ]
+        })
+      });
+      const data = await response.json();
+      const outputText = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+      console.log('[AI Moderator Gemini Verdict]:', outputText);
+      if (outputText.toUpperCase().includes('REJECTED')) {
+        return { status: 'rejected', reason: 'Failed safety moderation filter' };
+      }
+      if (outputText.toUpperCase().includes('APPROVED')) {
+        return { status: 'approved' };
+      }
+    } catch (err) {
+      console.warn('Gemini moderation API error, falling back to local safety rules:', err);
+    }
+  }
+
+  if (openAiKey) {
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openAiKey}`
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: MODERATOR_SYSTEM_PROMPT },
+            { role: 'user', content: question }
+          ],
+          temperature: 0
+        })
+      });
+      const data = await response.json();
+      const reply = data?.choices?.[0]?.message?.content?.trim() || '';
+      console.log('[AI Moderator OpenAI Verdict]:', reply);
+      if (reply.toUpperCase().includes('REJECTED')) {
+        return { status: 'rejected', reason: 'Failed safety moderation filter' };
+      }
+      if (reply.toUpperCase().includes('APPROVED')) {
+        return { status: 'approved' };
+      }
+    } catch (err) {
+      console.warn('OpenAI moderation API error, falling back to local safety rules:', err);
+    }
+  }
+
+  // Fallback safety classifier for school community safety
+  const lower = question.toLowerCase();
+  const badPatterns = [
+    /\b(fuck|shit|bitch|asshole|bastard|cunt|dick|pussy|slut|whore|nigger|faggot|retard|idiot|stupid|ugly|fat|loser|hate)\b/i,
+    /\b(sex|nude|nudes|naked|horny|porn|boobs|penis|vagina|hookup|drugs|weed|drunk|alcohol)\b/i,
+    /\b(kill yourself|kys|die|eww|disgusting|smells bad|creep|creepy|fake friend|snake|trash)\b/i,
+    /\b(chutiya|saala|kamina|gandu|harami|bhosdi|madarchod|behenchod|randi|kutta|bakwas)\b/i
+  ];
+
+  if (badPatterns.some(p => p.test(lower))) {
+    return { status: 'rejected', reason: 'Contains prohibited, inappropriate, or hurtful language' };
+  }
+
+  if (question.trim().length < 5) {
+    return { status: 'rejected', reason: 'Question is too short' };
+  }
+
+  return { status: 'approved' };
+};
+
+// Check Custom Poll Status & Monthly Remaining Limit
+app.get('/api/custom-polls/status/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    // Check user God Mode status
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, is_god_mode, is_pro, invites')
+      .eq('id', userId)
+      .maybeSingle();
+
+    const isGodMode = Boolean(user?.is_god_mode || user?.is_pro || (user?.invites || 0) >= 25);
+
+    // Calculate start of current month
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+    const { count } = await supabase
+      .from('custom_polls')
+      .select('id', { count: 'exact', head: true })
+      .eq('created_by', userId)
+      .gte('created_at', startOfMonth);
+
+    let monthlyCount = count || 0;
+    try {
+      const sqliteRow = db.prepare(`
+        SELECT COUNT(*) as c FROM custom_polls 
+        WHERE created_by = ? AND created_at >= date('now', 'start of month')
+      `).get(userId);
+      if (sqliteRow?.c) monthlyCount = Math.max(monthlyCount, sqliteRow.c);
+    } catch (_) {}
+
+    res.json({
+      userId,
+      is_god_mode: isGodMode,
+      limit: 3,
+      count: monthlyCount,
+      remaining: Math.max(0, 3 - monthlyCount)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Submit Custom Poll with Rate Limiting (Max 3/month) and AI Moderation
+app.post('/api/submit-poll', async (req, res) => {
+  try {
+    const { userId, question } = req.body;
+    if (!userId || !question || !question.trim()) {
+      return res.status(400).json({ error: 'userId and question are required' });
+    }
+
+    const cleanQuestion = question.trim();
+
+    // 1. Verify God Mode Status
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, is_god_mode, is_pro, invites')
+      .eq('id', userId)
+      .maybeSingle();
+
+    const isGodMode = Boolean(user?.is_god_mode || user?.is_pro || (user?.invites || 0) >= 25);
+    if (!isGodMode) {
+      return res.status(403).json({
+        error: 'God Mode required: Invite 25 friends or upgrade to unlock custom poll creation.'
+      });
+    }
+
+    // 2. Enforce Rate Limit (Maximum 3 custom polls per user per month)
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+    const { count } = await supabase
+      .from('custom_polls')
+      .select('id', { count: 'exact', head: true })
+      .eq('created_by', userId)
+      .gte('created_at', startOfMonth);
+
+    let monthlyCount = count || 0;
+    try {
+      const sqliteRow = db.prepare(`
+        SELECT COUNT(*) as c FROM custom_polls 
+        WHERE created_by = ? AND created_at >= date('now', 'start of month')
+      `).get(userId);
+      if (sqliteRow?.c) monthlyCount = Math.max(monthlyCount, sqliteRow.c);
+    } catch (_) {}
+
+    if (monthlyCount >= 3) {
+      return res.status(429).json({
+        error: 'Monthly rate limit reached. You can only submit up to 3 custom polls per calendar month.',
+        limit: 3,
+        count: monthlyCount,
+        remaining: 0
+      });
+    }
+
+    // 3. AI Safety Moderation
+    const moderationResult = await moderatePollQuestion(cleanQuestion);
+
+    if (moderationResult.status === 'rejected') {
+      // Record rejected poll for safety audit
+      try {
+        await supabase
+          .from('custom_polls')
+          .insert([{
+            question: cleanQuestion,
+            created_by: userId,
+            status: 'rejected',
+            created_at: new Date().toISOString()
+          }]);
+      } catch (_) {}
+
+      try {
+        db.prepare('INSERT INTO custom_polls (id, question, created_by, status) VALUES (?, ?, ?, ?)').run(
+          `poll-rej-${Date.now()}`,
+          cleanQuestion,
+          userId,
+          'rejected'
+        );
+      } catch (_) {}
+
+      return res.status(400).json({
+        success: false,
+        status: 'rejected',
+        error: 'Poll rejected by AI Safety Moderator. The question does not meet school community safety guidelines.'
+      });
+    }
+
+    // 4. APPROVED: Save to custom_polls and active polls table
+    let savedCustomPoll = null;
+    const { data: insertedPoll, error: insertErr } = await supabase
+      .from('custom_polls')
+      .insert([{
+        question: cleanQuestion,
+        created_by: userId,
+        status: 'approved',
+        created_at: new Date().toISOString()
+      }])
+      .select()
+      .maybeSingle();
+
+    savedCustomPoll = insertedPoll;
+
+    // Insert into active polls table so other students can vote on it
+    try {
+      await supabase
+        .from('polls')
+        .insert([{
+          question: cleanQuestion,
+          is_crush_poll: false
+        }]);
+    } catch (_) {}
+
+    // Save into SQLite
+    try {
+      const pollId = savedCustomPoll?.id || `poll-${Date.now()}`;
+      db.prepare('INSERT INTO custom_polls (id, question, created_by, status) VALUES (?, ?, ?, ?)').run(
+        pollId,
+        cleanQuestion,
+        userId,
+        'approved'
+      );
+      db.prepare('INSERT INTO polls (question, is_crush_poll) VALUES (?, 0)').run(cleanQuestion);
+    } catch (_) {}
+
+    const remaining = Math.max(0, 3 - (monthlyCount + 1));
+
+    return res.json({
+      success: true,
+      status: 'approved',
+      message: 'Poll approved by AI Moderator and published to school feed!',
+      poll: savedCustomPoll || { question: cleanQuestion, status: 'approved' },
+      remaining
+    });
+  } catch (err) {
+    console.error('Submit custom poll error:', err);
+    res.status(500).json({ error: 'Server error while submitting custom poll: ' + err.message });
   }
 });
 

@@ -61,6 +61,20 @@ safeAddColumn("referral_rewarded BOOLEAN DEFAULT 0");
 safeAddColumn("institute TEXT DEFAULT 'Kapil Institute'");
 safeAddColumn("coaching_hub TEXT DEFAULT 'Ajit Road Hub'");
 safeAddColumn("stream TEXT DEFAULT '11th Medical'");
+safeAddColumn("is_god_mode BOOLEAN DEFAULT 0");
+
+// Safe table migration for custom_polls
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS custom_polls (
+      id TEXT PRIMARY KEY,
+      question TEXT NOT NULL,
+      created_by TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      status TEXT DEFAULT 'pending'
+    );
+  `);
+} catch (_) {}
 
 // Seed or augment tuition-focused polls
 const count = db.prepare('SELECT count(*) AS c FROM polls').get();
