@@ -643,6 +643,21 @@ app.get('/api/classmates/suggested', async (req, res) => {
 });
 
 // --- PLAY & VOTING ---
+const JUNIOR_POLLS_FALLBACK = [
+  { id: 101, question: "Brings the best lunchbox that everyone attacks at recess?", is_crush_poll: false },
+  { id: 102, question: "Always reminds the teacher about yesterday's homework?", is_crush_poll: false },
+  { id: 103, question: "Draws the best doodles on the last page of their notebook?", is_crush_poll: false },
+  { id: 104, question: "Fastest runner during the sports period?", is_crush_poll: false },
+  { id: 105, question: "Carries the heaviest school bag with 10 different gel pens?", is_crush_poll: false },
+  { id: 106, question: "Class clown who always makes the teacher smile?", is_crush_poll: false },
+  { id: 107, question: "Secret crush in the junior wing", is_crush_poll: true },
+  { id: 108, question: "Best handwriting on the blackboard during monitor duty?", is_crush_poll: false },
+  { id: 109, question: "Always loses their sharpener or eraser by second period?", is_crush_poll: false },
+  { id: 110, question: "First to finish their tiffin box before the recess bell rings?", is_crush_poll: false },
+  { id: 111, question: "Most likely to represent the school in the Science Olympiad?", is_crush_poll: false },
+  { id: 112, question: "Can solve the hardest Maths questions without hesitation?", is_crush_poll: false }
+];
+
 const TUITION_POLLS_FALLBACK = [
   { id: 1, question: "Always sleeps through 5 PM Physics?", is_crush_poll: false },
   { id: 2, question: "Most likely to crack NEET on the first attempt?", is_crush_poll: false },
@@ -661,9 +676,26 @@ app.get('/api/play/:userId', async (req, res) => {
     const { data: user } = await supabase.from('users').select('*').eq('id', voterId).maybeSingle();
     const cooldownState = await getUserCooldownState(voterId, user);
 
+    const uGrade = user?.grade ? String(user.grade) : '';
+    const uStream = (user?.stream || '').toLowerCase();
+    const isJunior = ['6', '7', '8', '9', 6, 7, 8, 9].includes(user?.grade) ||
+      uStream.includes('class 6') || uStream.includes('class 7') || uStream.includes('class 8') || uStream.includes('class 9') ||
+      ['6', '7', '8', '9'].includes(String(gradeFilter).trim());
+
     let { data: polls } = await supabase.from('polls').select('*');
     if (!polls || polls.length === 0) {
-      polls = TUITION_POLLS_FALLBACK;
+      polls = isJunior ? JUNIOR_POLLS_FALLBACK : TUITION_POLLS_FALLBACK;
+    } else {
+      // Filter DB polls by audience
+      const filtered = polls.filter(p => {
+        if (p.audience === 'junior' || p.category === 'junior' || p.target_group === 'junior') return isJunior;
+        if (p.audience === 'senior' || p.category === 'senior' || p.target_group === 'senior') return !isJunior;
+        const q = (p.question || '').toLowerCase();
+        const isSeniorQ = q.includes('neet') || q.includes('jee') || q.includes('allen') || q.includes('aakash') || q.includes('hc verma') || q.includes('physics');
+        const isJuniorQ = q.includes('lunchbox') || q.includes('tiffin') || q.includes('recess') || q.includes('junior') || q.includes('sports period');
+        return isJunior ? (!isSeniorQ || isJuniorQ) : (!isJuniorQ || isSeniorQ);
+      });
+      polls = filtered.length >= 4 ? filtered : (isJunior ? JUNIOR_POLLS_FALLBACK : TUITION_POLLS_FALLBACK);
     }
     const randomPoll = polls[Math.floor(Math.random() * polls.length)];
 
@@ -675,8 +707,15 @@ app.get('/api/play/:userId', async (req, res) => {
       query = query.eq('institute', targetInstitute);
     }
 
+    // Strict Silo: Junior vs Senior cohort candidate isolation
+    if (isJunior) {
+      query = query.or('grade.eq.6,grade.eq.7,grade.eq.8,grade.eq.9,stream.ilike.%Class 6%,stream.ilike.%Class 7%,stream.ilike.%Class 8%,stream.ilike.%Class 9%');
+    } else {
+      query = query.not('grade', 'in', '(6,7,8,9)').not('stream', 'ilike', '%Class 6%').not('stream', 'ilike', '%Class 7%').not('stream', 'ilike', '%Class 8%').not('stream', 'ilike', '%Class 9%');
+    }
+
     const activeFilter = streamFilter || gradeFilter;
-    if (activeFilter && activeFilter !== 'all' && activeFilter !== 'All Bathinda') {
+    if (activeFilter && activeFilter !== 'all' && activeFilter !== 'All Bathinda' && !activeFilter.startsWith('All')) {
       if (activeFilter.includes('Class') || activeFilter.includes('Med') || activeFilter.includes('JEE') || activeFilter.includes('NEET') || activeFilter.includes('Arts') || activeFilter.includes('Commerce') || activeFilter.includes('Board') || activeFilter.includes('Dropper')) {
         query = query.ilike('stream', `%${activeFilter}%`);
       } else {
@@ -686,7 +725,13 @@ app.get('/api/play/:userId', async (req, res) => {
 
     let { data: allUsers } = await query;
     // Strictly isolate: do not augment with rival institutes or other schools
-    const instituteUsers = (allUsers || []).filter(u => !targetInstitute || u.institute === targetInstitute);
+    const instituteUsers = (allUsers || []).filter(u => {
+      if (targetInstitute && u.institute !== targetInstitute) return false;
+      const cGrade = String(u.grade || '');
+      const cStream = String(u.stream || '').toLowerCase();
+      const cIsJunior = ['6', '7', '8', '9'].includes(cGrade) || cStream.includes('class 6') || cStream.includes('class 7') || cStream.includes('class 8') || cStream.includes('class 9');
+      return isJunior ? cIsJunior : !cIsJunior;
+    });
 
     const shuffledOptions = instituteUsers.sort(() => 0.5 - Math.random()).slice(0, 4);
     res.json({
