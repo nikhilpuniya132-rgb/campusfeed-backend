@@ -683,20 +683,22 @@ app.get('/api/play/:userId', async (req, res) => {
       uStream.includes('class 6') || uStream.includes('class 7') || uStream.includes('class 8') || uStream.includes('class 9') ||
       ['6', '7', '8', '9'].includes(String(gradeFilter).trim());
 
-    let { data: polls } = await supabase.from('polls').select('*');
+    // DYNAMIC TABLE ROUTING & ZERO CROSS-CONTAMINATION:
+    // IF user is Junior (Class 6, 7, 8, 9): Fetch questions ONLY from `polls2`.
+    // IF user is Senior (Class 10-12+): Fetch questions ONLY from `polls`.
+    const targetPollsTable = isJunior ? 'polls2' : 'polls';
+    let polls = [];
+    try {
+      const { data: dbPolls, error: pollError } = await supabase.from(targetPollsTable).select('*');
+      if (!pollError && dbPolls && dbPolls.length > 0) {
+        polls = dbPolls;
+      }
+    } catch (err) {
+      console.warn(`Error querying ${targetPollsTable}:`, err.message);
+    }
+
     if (!polls || polls.length === 0) {
       polls = isJunior ? JUNIOR_POLLS_FALLBACK : TUITION_POLLS_FALLBACK;
-    } else {
-      // Filter DB polls by audience
-      const filtered = polls.filter(p => {
-        if (p.audience === 'junior' || p.category === 'junior' || p.target_group === 'junior') return isJunior;
-        if (p.audience === 'senior' || p.category === 'senior' || p.target_group === 'senior') return !isJunior;
-        const q = (p.question || '').toLowerCase();
-        const isSeniorQ = q.includes('neet') || q.includes('jee') || q.includes('allen') || q.includes('aakash') || q.includes('hc verma') || q.includes('physics');
-        const isJuniorQ = q.includes('lunchbox') || q.includes('tiffin') || q.includes('recess') || q.includes('junior') || q.includes('sports period');
-        return isJunior ? (!isSeniorQ || isJuniorQ) : (!isJuniorQ || isSeniorQ);
-      });
-      polls = filtered.length >= 4 ? filtered : (isJunior ? JUNIOR_POLLS_FALLBACK : TUITION_POLLS_FALLBACK);
     }
     const randomPoll = polls[Math.floor(Math.random() * polls.length)];
 
@@ -1912,10 +1914,11 @@ app.post('/api/submit-poll', async (req, res) => {
 
     savedCustomPoll = insertedPoll;
 
-    // Insert into active polls table so other students can vote on it
+    // Insert into active polls table (polls2 for Junior, polls for Senior)
+    const targetActivePollTable = isJunior ? 'polls2' : 'polls';
     try {
       await supabase
-        .from('polls')
+        .from(targetActivePollTable)
         .insert([{
           question: cleanQuestion,
           is_crush_poll: false
