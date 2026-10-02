@@ -849,6 +849,86 @@ app.post('/api/vote', async (req, res) => {
   }
 });
 
+// --- VOTING HISTORY LOG FOR TODAY ---
+app.get('/api/votes/today/:userId', async (req, res) => {
+  try {
+    const voterId = req.params.userId;
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const startIso = startOfToday.toISOString();
+
+    const { data: rawVotes, error } = await supabase
+      .from('votes')
+      .select('id, poll_id, receiver_id, created_at')
+      .eq('voter_id', voterId)
+      .gte('created_at', startIso)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const votes = rawVotes || [];
+    const totalToday = votes.length;
+
+    if (totalToday === 0) {
+      return res.json({ totalToday: 0, history: [] });
+    }
+
+    const receiverIds = [...new Set(votes.map(v => v.receiver_id).filter(Boolean))];
+    const pollIds = [...new Set(votes.map(v => v.poll_id).filter(Boolean))];
+
+    let userMap = {};
+    if (receiverIds.length > 0) {
+      const { data: receivers } = await supabase
+        .from('users')
+        .select('id, name, handle, avatar, profile_pic')
+        .in('id', receiverIds);
+      (receivers || []).forEach(u => {
+        userMap[u.id] = u;
+      });
+    }
+
+    let pollMap = {};
+    if (pollIds.length > 0) {
+      try {
+        const { data: p1 } = await supabase.from('polls').select('id, question').in('id', pollIds);
+        (p1 || []).forEach(p => { pollMap[p.id] = p.question; });
+      } catch (_) {}
+      try {
+        const { data: p2 } = await supabase.from('polls2').select('id, question').in('id', pollIds);
+        (p2 || []).forEach(p => { pollMap[p.id] = p.question; });
+      } catch (_) {}
+    }
+
+    const allFallbacks = [...JUNIOR_POLLS_FALLBACK, ...TUITION_POLLS_FALLBACK];
+    allFallbacks.forEach(fp => {
+      if (!pollMap[fp.id]) pollMap[fp.id] = fp.question;
+    });
+
+    const history = votes.map(v => {
+      const cand = userMap[v.receiver_id];
+      const candidateName = cand ? (cand.name || `@${cand.handle}`) : 'Classmate';
+      const candidateHandle = cand ? cand.handle : '';
+      const question = pollMap[v.poll_id] || 'School poll';
+      return {
+        id: v.id,
+        pollId: v.poll_id,
+        question,
+        candidateName,
+        candidateHandle,
+        candidateAvatar: cand?.avatar || '😎',
+        candidateProfilePic: cand?.profile_pic || '',
+        createdAt: v.created_at
+      };
+    });
+
+    res.json({ totalToday, history });
+  } catch (err) {
+    console.error('Error fetching today votes:', err);
+    res.status(500).json({ error: err.message, totalToday: 0, history: [] });
+  }
+});
+
+
 // Clear Cooldown (God Mode VIP activation or verified timer expiry)
 app.post('/api/cooldown/skip', async (req, res) => {
   try {
