@@ -276,12 +276,13 @@ app.get('/api/user/cooldown/:userId', async (req, res) => {
 
     const { data: user } = await supabase
       .from('users')
-      .select('id, session_vote_count, cooldown_until, cooldown_expires_at, is_pro')
+      .select('id, session_vote_count, cooldown_until, cooldown_expires_at, is_pro, is_god_mode, is_legend, invites')
       .eq('id', userId)
       .maybeSingle();
 
+    const hasUnlimitedVotes = Boolean(user?.is_pro || user?.is_god_mode || user?.is_legend || (user?.invites || 0) >= 3);
     const state = await getUserCooldownState(userId, user);
-    const activeCd = (!user?.is_pro && (state.cooldown_until || user?.cooldown_expires_at)) || null;
+    const activeCd = (!hasUnlimitedVotes && (state.cooldown_until || user?.cooldown_expires_at)) || null;
     const isCooldownActive = Boolean(activeCd && new Date(activeCd).getTime() > Date.now());
 
     res.json({
@@ -289,7 +290,7 @@ app.get('/api/user/cooldown/:userId', async (req, res) => {
       cooldown_until: isCooldownActive ? activeCd : null,
       session_vote_count: isCooldownActive ? state.session_vote_count : 0,
       is_cooldown_active: isCooldownActive,
-      is_pro: Boolean(user?.is_pro)
+      is_pro: hasUnlimitedVotes
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -759,8 +760,9 @@ app.post('/api/vote', async (req, res) => {
     let cooldown_until = state.cooldown_until;
     let session_vote_count = (state.session_vote_count || 0) + 1;
 
-    // Check 12-vote threshold for free users
-    if (!voter?.is_pro && session_vote_count >= 12) {
+    // Check 12-vote threshold for normal users (0-2 invites)
+    const hasUnlimitedVotes = Boolean(voter?.is_pro || voter?.is_god_mode || voter?.is_legend || (voter?.invites || 0) >= 3);
+    if (!hasUnlimitedVotes && session_vote_count >= 12) {
       cooldown_until = new Date(Date.now() + 30 * 60 * 1000).toISOString();
       session_vote_count = 0;
     }
@@ -1181,13 +1183,13 @@ const handleRevealRequest = async (voteId, userId, res) => {
       count = (invitedUsers || []).length;
     }
     const effectiveInvites = Math.max(count, user.invites || 0);
-    const isGodMode = Boolean(user.is_pro);
+    const isGodMode = Boolean(user.is_pro || user.is_god_mode || user.is_legend);
     const hasAccess = isGodMode || effectiveInvites >= 3;
 
     // Fetch the vote with voter and poll details
     const { data: vote, error: voteError } = await supabase
       .from('votes')
-      .select(`id, poll_id, voter_id, receiver_id, created_at, users!voter_id(id, handle, name, avatar, profile_pic, ring, is_pro, gender), polls(question)`)
+      .select(`id, poll_id, voter_id, receiver_id, created_at, users!voter_id(id, handle, name, avatar, profile_pic, ring, is_pro, is_god_mode, is_legend, invites, gender), polls(question)`)
       .eq('id', voteId)
       .single();
 
@@ -1232,6 +1234,7 @@ const handleRevealRequest = async (voteId, userId, res) => {
       voterGender: vote.users?.gender || 'boy',
       createdAt: vote.created_at,
       isPro: Boolean(vote.users?.is_pro),
+      isLegend: Boolean(vote.users?.is_god_mode || vote.users?.is_legend || (vote.users?.invites >= 25)),
       ring: vote.users?.ring || 'none',
       question: vote.polls?.question
     });
@@ -1762,14 +1765,17 @@ app.get('/api/custom-polls/status/:userId', async (req, res) => {
     const { userId } = req.params;
     if (!userId) return res.status(400).json({ error: 'userId is required' });
 
-    // Check user God Mode status
+    // Check user God Mode / Legend status
     const { data: user } = await supabase
       .from('users')
-      .select('id, is_god_mode, is_pro, invites')
+      .select('id, is_god_mode, is_legend, is_pro, invites')
       .eq('id', userId)
       .maybeSingle();
 
-    const isGodMode = Boolean(user?.is_god_mode || user?.is_pro || (user?.invites || 0) >= 25);
+    const effectiveInvites = user?.invites || 0;
+    const isLegend = Boolean(user?.is_god_mode || user?.is_legend || effectiveInvites >= 25);
+    const hasAccess = Boolean(isLegend || user?.is_pro || effectiveInvites >= 3);
+    const limit = isLegend ? 150 : (hasAccess ? 3 : 0);
 
     // Calculate start of current month
     const now = new Date();
@@ -1792,17 +1798,18 @@ app.get('/api/custom-polls/status/:userId', async (req, res) => {
 
     res.json({
       userId,
-      is_god_mode: isGodMode,
-      limit: 3,
+      is_god_mode: hasAccess,
+      is_legend: isLegend,
+      limit,
       count: monthlyCount,
-      remaining: Math.max(0, 3 - monthlyCount)
+      remaining: Math.max(0, limit - monthlyCount)
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Submit Custom Poll with Rate Limiting (Max 3/month) and AI Moderation
+// Submit Custom Poll with Rate Limiting (3/mo for Basic, 150/mo for Lifetime Legend) and AI Moderation
 app.post('/api/submit-poll', async (req, res) => {
   try {
     const { userId, question } = req.body;
@@ -1812,21 +1819,25 @@ app.post('/api/submit-poll', async (req, res) => {
 
     const cleanQuestion = question.trim();
 
-    // 1. Verify God Mode Status
+    // 1. Verify God Mode / Legend Status
     const { data: user } = await supabase
       .from('users')
-      .select('id, is_god_mode, is_pro, invites')
+      .select('id, is_god_mode, is_legend, is_pro, invites')
       .eq('id', userId)
       .maybeSingle();
 
-    const isGodMode = Boolean(user?.is_god_mode || user?.is_pro || (user?.invites || 0) >= 25);
-    if (!isGodMode) {
+    const effectiveInvites = user?.invites || 0;
+    const isLegend = Boolean(user?.is_god_mode || user?.is_legend || effectiveInvites >= 25);
+    const hasAccess = Boolean(isLegend || user?.is_pro || effectiveInvites >= 3);
+
+    if (!hasAccess) {
       return res.status(403).json({
-        error: 'God Mode required: Invite 25 friends or upgrade to unlock custom poll creation.'
+        error: 'Custom polls locked. Normal users cannot create custom polls. Invite 3 friends for up to 3 polls/month, or 25 friends (Lifetime Legend) for up to 150 polls/month.'
       });
     }
 
-    // 2. Enforce Rate Limit (Maximum 3 custom polls per user per month)
+    // 2. Enforce Rate Limit (3 for Basic God Mode, 150 for Lifetime Legend)
+    const monthlyLimit = isLegend ? 150 : 3;
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
 
@@ -1845,10 +1856,10 @@ app.post('/api/submit-poll', async (req, res) => {
       if (sqliteRow?.c) monthlyCount = Math.max(monthlyCount, sqliteRow.c);
     } catch (_) {}
 
-    if (monthlyCount >= 3) {
+    if (monthlyCount >= monthlyLimit) {
       return res.status(429).json({
-        error: 'Monthly rate limit reached. You can only submit up to 3 custom polls per calendar month.',
-        limit: 3,
+        error: `Monthly rate limit reached. You can only submit up to ${monthlyLimit} custom polls per calendar month.`,
+        limit: monthlyLimit,
         count: monthlyCount,
         remaining: 0
       });
