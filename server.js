@@ -688,19 +688,35 @@ app.get('/api/play/:userId', async (req, res) => {
     // IF user is Senior (Class 10-12+): Fetch questions ONLY from `polls`.
     const targetPollsTable = isJunior ? 'polls2' : 'polls';
     let polls = [];
+    let excludedIds = [];
     try {
-      const { data: dbPolls, error: pollError } = await supabase.from(targetPollsTable).select('*');
+      // 1. Fetch question IDs that exist in the user's activity history (votes and skips)
+      const { data: userActivity } = await supabase
+        .from('votes')
+        .select('poll_id')
+        .eq('voter_id', voterId);
+
+      excludedIds = (userActivity || []).map(a => a.poll_id).filter(Boolean);
+
+      // 2. Query active questions strictly excluding any question_id from user's activity history
+      let pollQuery = supabase.from(targetPollsTable).select('*');
+      if (excludedIds.length > 0) {
+        pollQuery = pollQuery.not('id', 'in', `(${excludedIds.join(',')})`);
+      }
+
+      const { data: dbPolls, error: pollError } = await pollQuery;
       if (!pollError && dbPolls && dbPolls.length > 0) {
-        polls = dbPolls;
+        polls = dbPolls.filter(p => !excludedIds.includes(p.id));
       }
     } catch (err) {
       console.warn(`Error querying ${targetPollsTable}:`, err.message);
     }
 
     if (!polls || polls.length === 0) {
-      polls = isJunior ? JUNIOR_POLLS_FALLBACK : TUITION_POLLS_FALLBACK;
+      polls = (isJunior ? JUNIOR_POLLS_FALLBACK : TUITION_POLLS_FALLBACK)
+        .filter(p => !excludedIds.includes(p.id));
     }
-    const randomPoll = polls[Math.floor(Math.random() * polls.length)];
+    const randomPoll = polls.length > 0 ? polls[Math.floor(Math.random() * polls.length)] : null;
 
     const targetInstitute = (req.query.institute || user?.institute || '').trim();
     let query = supabase.from('users').select('id, handle, name, avatar, profile_pic, grade, stream, institute, coaching_hub, is_pro, ring, selected_ring').neq('id', voterId);
